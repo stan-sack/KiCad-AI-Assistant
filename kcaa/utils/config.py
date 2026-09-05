@@ -165,15 +165,20 @@ class ServerConfig:
         self._system = _SYSTEM
 
         # KiCad version — from KICAD_VERSION env var (.env), or detected
-        # from KICAD{N}_* variables. Raises RuntimeError if undetermined.
+        # from KICAD{N}_* variables. Falls back to a default "10.0" if
+        # undetermined so the MCP can still start in environments without
+        # KiCad installed (e.g. CI sandboxes). Tools that actually need
+        # KiCad will fail with a clearer error when invoked.
         self._kicad_version = (
             os.environ.get("KICAD_VERSION") or self._detect_kicad_version_from_env()
         )
         if self._kicad_version is None:
-            raise RuntimeError(
-                "Cannot detect KiCad version. Set KICAD_VERSION in .env or ensure "
-                "KICAD{N}_* environment variables are present."
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Cannot detect KiCad version (set KICAD_VERSION in .env or "
+                "KICAD{N}_* env vars). Falling back to '10.0'."
             )
+            self._kicad_version = "10.0"
         self._ver_tag = self._kicad_version.split(".")[0]
 
         # Platform-specific paths

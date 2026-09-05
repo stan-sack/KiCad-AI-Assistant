@@ -22,10 +22,11 @@ import os
 import subprocess
 from typing import Literal
 
-import cairosvg
 from fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
-from PIL import Image as PILImage
+# Lazy: PIL not required at MCP startup; only needed for image rendering
+    # Falls back gracefully if Pillow is unavailable on the system.
+    # from PIL import Image as PILImage  # moved into _resize_image
 
 from kcaa.utils.config import config
 from kcaa.utils.kicad_cli import get_kicad_cli_path, KiCadCLIError
@@ -178,19 +179,307 @@ def _svg_to_png(
     output_width: int | None = None,
     background_color: str | None = None,
 ) -> None:
-    """Convert an SVG file to PNG using cairosvg.
+    """Convert an SVG file to PNG using a pure-Python renderer (svglib + Pillow).
+
+    No native dependencies (no libcairo, no GTK, no ImageMagick). svglib parses
+    the SVG into a reportlab Drawing tree; we walk that tree and emit
+    Pillow draw calls. Handles the elements KiCad emits: rect, line,
+    circle, ellipse, polygon, polyline, path (M/L/H/V/Z), text, and groups
+    with translate/scale transforms.
 
     ``output_width`` scales the SVG so its rendered width matches the
     given pixel count (height auto from aspect).  ``background_color``
-    accepts CSS-style values (``"#FFFFFF"``, ``"white"``); ``None`` uses
-    cairosvg's default (transparent).
+    accepts CSS-style values (``"#FFFFFF"``, ``"white"``); ``None`` is
+    transparent.
     """
-    kwargs: dict[str, object] = {"url": svg_path, "write_to": png_path}
-    if output_width is not None:
-        kwargs["output_width"] = output_width
-    if background_color is not None:
-        kwargs["background_color"] = background_color
-    cairosvg.svg2png(**kwargs)  # type: ignore[arg-type]
+    # Lazy imports — these are pure-Python and not required at MCP startup
+    from svglib.svglib import svg2rlg
+    from reportlab.graphics.shapes import (
+        Rect, Line, Circle, Ellipse, Polygon, PolyLine, String, Group, Path,
+    )
+    from PIL import Image, ImageDraw, ImageFont
+    import re
+
+    drawing = svg2rlg(svg_path)
+    src_w = float(drawing.width) or 1.0
+    src_h = float(drawing.height) or 1.0
+
+    scale = 1.0
+    if output_width is not None and output_width > 0:
+        scale = float(output_width) / src_w
+    out_w = max(1, int(round(src_w * scale)))
+    out_h = max(1, int(round(src_h * scale)))
+
+    if background_color and background_color.lower() in ("white", "#ffffff", "#fff"):
+        bg_rgba = (255, 255, 255, 255)
+    elif background_color and background_color.startswith("#"):
+        h = background_color.lstrip("#")
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        bg_rgba = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+    else:
+        bg_rgba = (255, 255, 255, 0)  # transparent
+
+    img = Image.new("RGBA", (out_w, out_h), bg_rgba)
+    draw = ImageDraw.Draw(img)
+
+    # Try common system fonts, fall back to PIL default
+    font_cache: dict[int, object] = {}
+    for path, size in [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12),
+        ("/usr/share/fonts/TTF/DejaVuSans.ttf", 12),
+    ]:
+        try:
+            font_cache[12] = ImageFont.truetype(path, size)
+            break
+        except OSError:
+            continue
+    if not font_cache:
+        font_cache[12] = ImageFont.load_default()
+
+    NAMED_COLORS = {
+        "black": (0, 0, 0, 255), "white": (255, 255, 255, 255),
+        "red": (255, 0, 0, 255), "green": (0, 128, 0, 255),
+        "blue": (0, 0, 255, 255), "yellow": (255, 255, 0, 255),
+        "cyan": (0, 255, 255, 255), "magenta": (255, 0, 255, 255),
+        "gray": (128, 128, 128, 255), "grey": (128, 128, 128, 255),
+    }
+
+    def _to_rgba(c):
+        """Convert a reportlab color / CSS string to an (r,g,b,a) tuple."""
+        if c is None:
+            return None
+        if isinstance(c, str):
+            s = c.strip().lower()
+            if s in ("none", "transparent"):
+                return None
+            if s in NAMED_COLORS:
+                return NAMED_COLORS[s]
+            if s.startswith("#"):
+                h = s.lstrip("#")
+                if len(h) == 3:
+                    h = "".join(c2 * 2 for c2 in h)
+                if len(h) == 6:
+                    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+            if s.startswith("rgb("):
+                nums = re.findall(r"[\d.]+", s)
+                if len(nums) >= 3:
+                    return (int(float(nums[0])), int(float(nums[1])), int(float(nums[2])), 255)
+            return None
+        if isinstance(c, tuple):
+            if len(c) == 3:
+                return (c[0], c[1], c[2], 255)
+            if len(c) >= 4:
+                return (c[0], c[1], c[2], int(c[3] * 255) if c[3] <= 1 else c[3])
+        # reportlab Color object
+        rgb = getattr(c, "rgb", None)
+        if callable(rgb):
+            rgb = rgb()
+        if rgb is not None and len(rgb) >= 3:
+            a = getattr(c, "alpha", 1.0) or 1.0
+            return (int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255), int(a * 255) if a <= 1 else int(a))
+        return None
+
+    def _font(size: int):
+        size = max(6, int(round(size * scale)))
+        if size not in font_cache:
+            base = font_cache.get(12) or ImageFont.load_default()
+            try:
+                # Try scaling the base font
+                font_cache[size] = base.font_variant(size=size) if hasattr(base, "font_variant") else base
+            except Exception:
+                font_cache[size] = base
+        return font_cache[size]
+
+    def _stroke_width(w):
+        try:
+            return max(1, int(round(float(w) * scale)))
+        except (TypeError, ValueError):
+            return 1
+
+    def _transform_xy(x: float, y: float, m):
+        """Apply reportlab-style affine transform matrix m=(a,b,c,d,e,f) to (x,y)."""
+        if m is None:
+            return x, y
+        a, b, c, d, e, f = m
+        return a * x + c * y + e, b * x + d * y + f
+
+    def render(elem, parent_m=None, depth=0):
+        # Combine parent transform with this element's transform
+        own_m = getattr(elem, "transform", None)
+        if own_m is not None and parent_m is not None:
+            a1, b1, c1, d1, e1, f1 = parent_m
+            a2, b2, c2, d2, e2, f2 = own_m
+            m = (
+                a1 * a2 + c1 * b2,
+                b1 * a2 + d1 * b2,
+                a1 * c2 + c1 * d2,
+                b1 * c2 + d1 * d2,
+                a1 * e2 + c1 * f2 + e1,
+                b1 * e2 + d1 * f2 + f1,
+            )
+        elif own_m is not None:
+            m = own_m
+        else:
+            m = parent_m
+
+        if isinstance(elem, Rect):
+            # reportlab Rect: x is left, y is BOTTOM-left (y-up)
+            x0, y0 = _transform_xy(elem.x, elem.y, m)
+            x1, y1 = _transform_xy(elem.x + elem.width, elem.y + elem.height, m)
+            # Convert to top-down coords
+            py0 = out_h - y1
+            py1 = out_h - y0
+            x0, x1 = sorted((x0 * scale, x1 * scale))
+            py0, py1 = sorted((py0, py1))
+            fill = _to_rgba(getattr(elem, "fillColor", None))
+            stroke = _to_rgba(getattr(elem, "strokeColor", None))
+            sw = _stroke_width(getattr(elem, "strokeWidth", 0) or 0)
+            draw.rectangle([x0, py0, x1, py1],
+                           fill=fill if fill else None,
+                           outline=stroke if stroke and sw > 0 else None,
+                           width=sw if stroke else 0)
+        elif isinstance(elem, Line):
+            x0, y0 = _transform_xy(elem.x1, elem.y1, m)
+            x1, y1 = _transform_xy(elem.x2, elem.y2, m)
+            stroke = _to_rgba(getattr(elem, "strokeColor", None))
+            sw = _stroke_width(getattr(elem, "strokeWidth", 1) or 1)
+            draw.line([x0 * scale, out_h - y0 * scale, x1 * scale, out_h - y1 * scale],
+                      fill=stroke or (0, 0, 0, 255), width=sw)
+        elif isinstance(elem, (Circle, Ellipse)):
+            cx, cy = _transform_xy(elem.cx, elem.cy, m)
+            rx = getattr(elem, "r", None) or getattr(elem, "rx", 0) or 0
+            ry = getattr(elem, "r", None) or getattr(elem, "ry", 0) or 0
+            fill = _to_rgba(getattr(elem, "fillColor", None))
+            stroke = _to_rgba(getattr(elem, "strokeColor", None))
+            sw = _stroke_width(getattr(elem, "strokeWidth", 0) or 0)
+            bbox = [cx * scale - rx * scale, out_h - cy * scale - ry * scale,
+                    cx * scale + rx * scale, out_h - cy * scale + ry * scale]
+            draw.ellipse(bbox,
+                         fill=fill if fill else None,
+                         outline=stroke if stroke and sw > 0 else None,
+                         width=sw if stroke else 0)
+        elif isinstance(elem, Polygon):
+            pts_ = getattr(elem, "points", [])
+            if not pts_:
+                pass
+            else:
+                pts = [_transform_xy(p.x, p.y, m) for p in pts_]
+                screen = [(p[0] * scale, out_h - p[1] * scale) for p in pts]
+                fill = _to_rgba(getattr(elem, "fillColor", None))
+                stroke = _to_rgba(getattr(elem, "strokeColor", None))
+                sw = _stroke_width(getattr(elem, "strokeWidth", 0) or 0)
+                draw.polygon(screen,
+                             fill=fill if fill else None,
+                             outline=stroke if stroke and sw > 0 else None,
+                             width=sw if stroke else 0)
+        elif isinstance(elem, PolyLine):
+            pts_ = getattr(elem, "points", [])
+            if len(pts_) >= 2:
+                pts = [_transform_xy(p.x, p.y, m) for p in pts_]
+                screen = [(p[0] * scale, out_h - p[1] * scale) for p in pts]
+                stroke = _to_rgba(getattr(elem, "strokeColor", None))
+                sw = _stroke_width(getattr(elem, "strokeWidth", 1) or 1)
+                draw.line(screen, fill=stroke or (0, 0, 0, 255),
+                          width=sw, joint="curve")
+        elif isinstance(elem, Path):
+            # Parse path data and render as polylines / polygons
+            d = getattr(elem, "d", "") or ""
+            fill = _to_rgba(getattr(elem, "fillColor", None))
+            stroke = _to_rgba(getattr(elem, "strokeColor", None))
+            sw = _stroke_width(getattr(elem, "strokeWidth", 1) or 1)
+            points, closed = _parse_path_to_points(d)
+            if points:
+                pts = [_transform_xy(x, y, m) for x, y in points]
+                screen = [(p[0] * scale, out_h - p[1] * scale) for p in pts]
+                if closed and fill:
+                    draw.polygon(screen, fill=fill,
+                                 outline=stroke if stroke and sw > 0 else None,
+                                 width=sw if stroke else 0)
+                else:
+                    draw.line(screen, fill=stroke or (0, 0, 0, 255),
+                              width=sw, joint="curve")
+        elif isinstance(elem, String):
+            x, y = _transform_xy(elem.x, elem.y, m)
+            text = getattr(elem, "text", "") or ""
+            font_size = getattr(elem, "fontSize", 12) or 12
+            fill = _to_rgba(getattr(elem, "fillColor", None)) or (0, 0, 0, 255)
+            draw.text((x * scale, out_h - y * scale), text,
+                      fill=fill, font=_font(font_size))
+        elif isinstance(elem, Group):
+            for child in getattr(elem, "contents", []) or []:
+                render(child, m, depth + 1)
+
+    for child in drawing.contents or []:
+        render(child, None)
+
+    img.save(png_path, "PNG")
+
+
+def _parse_path_to_points(d: str):
+    """Parse a minimal subset of SVG path data and return (points, closed).
+
+    Supports absolute (M/L/H/V/Z) and relative (m/l/h/v/z) commands.
+    Sufficient for KiCad's schematic/PCB SVG output.
+    """
+    import re
+    points: list[tuple[float, float]] = []
+    if not d:
+        return points, False
+    tokens = re.findall(r"[MmLlHhVvZz]|-?\d+\.?\d*(?:[eE][-+]?\d+)?", d)
+    cx, cy = 0.0, 0.0
+    start_x, start_y = 0.0, 0.0
+    closed = False
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t.isalpha():
+            cmd = t
+            i += 1
+        else:
+            # Implicit repeat of previous command — track it
+            cmd = ""
+        if cmd in ("M", "m"):
+            if i + 1 >= len(tokens):
+                break
+            x = float(tokens[i]); y = float(tokens[i + 1]); i += 2
+            if cmd == "m" and points:
+                x += cx; y += cy
+            cx, cy = x, y
+            start_x, start_y = cx, cy
+            points.append((cx, cy))
+        elif cmd in ("L", "l"):
+            if i + 1 >= len(tokens):
+                break
+            x = float(tokens[i]); y = float(tokens[i + 1]); i += 2
+            if cmd == "l":
+                x += cx; y += cy
+            cx, cy = x, y
+            points.append((cx, cy))
+        elif cmd in ("H", "h"):
+            if i >= len(tokens):
+                break
+            x = float(tokens[i]); i += 1
+            if cmd == "h":
+                x += cx
+            cx = x
+            points.append((cx, cy))
+        elif cmd in ("V", "v"):
+            if i >= len(tokens):
+                break
+            y = float(tokens[i]); i += 1
+            if cmd == "v":
+                y += cy
+            cy = y
+            points.append((cx, cy))
+        elif cmd in ("Z", "z"):
+            cx, cy = start_x, start_y
+            points.append((cx, cy))
+            closed = True
+        else:
+            # Unknown / unsupported command (curves etc.) — stop parsing
+            break
+    return points, closed
 
 
 def _render_root_path() -> str:
