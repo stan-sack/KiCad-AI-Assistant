@@ -96,6 +96,30 @@ This guide helps you troubleshoot common issues with the KiCad MCP Server.
 
 ## Working with KiCad
 
+### Preventing Schematic Corruption
+
+**KiCad's automatic save and local file history can race with the MCP's
+file writes, silently truncating `.kicad_sch` files.**  This is the
+most common source of "unclosed parens" or "corrupted schematic" errors.
+
+Disable both features before using the MCP:
+
+1. **Automatic save** — Preferences → Miscellaneous → uncheck
+   *Automatic save* (or set the interval to 0).
+2. **Local file history** — Preferences → Miscellaneous → uncheck
+   *Local file history* (sometimes labelled "Keeper" or "Versioning").
+
+On Linux you can also edit `~/.config/kicad/10.0/kicad.conf` directly:
+
+```ini
+[Common]
+AutosaveInterval=0
+```
+
+The MCP maintains its own version snapshots (`.versions/` directory)
+and multi-generation backups (`.bak`, `.bak.1`, …) so KiCad's
+built-in redundancy is not needed when the MCP is active.
+
 ### KiCad Python Modules Not Found
 
 **Symptoms:**

@@ -399,6 +399,9 @@ kcaa/
 - Linux: Check the plugin log in `~/.config/kicad/` for Python tracebacks.
 - Windows: Check the plugin log in `%APPDATA%/kicad/` for Python tracebacks.
 
+**Schematic corruption / "unclosed parens" errors:**
+- Disable KiCad's **Automatic save** and **Local file history** (Preferences → Miscellaneous). These can race with the MCP's file writes and silently truncate schematics. See [Troubleshooting — Preventing Schematic Corruption](docs/troubleshooting.md#preventing-schematic-corruption) for details.
+
 **Schematic editor does not refresh after edits:**
 - This is a current KiCad IPC limitation. Use **File → Reload** or press **Ctrl+Z / Ctrl+Y** to trigger a refresh in the schematic editor.
 
