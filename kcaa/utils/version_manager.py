@@ -194,6 +194,28 @@ def list_project_versions(project_file: str) -> list[dict[str, Any]]:
     return result
 
 
+def _restore_member(target: str, data: bytes, validate_schematic_bytes) -> None:
+    """Write *data* to *target*, atomically for ``.kicad_sch`` members.
+
+    ``.kicad_sch`` members are staged to a ``.tmp`` sibling, validated again,
+    and only then ``os.replace``d over the live file, so a mid-write failure
+    cannot leave the schematic half-overwritten.  Non-schematic members use a
+    plain write.
+    """
+    if target.endswith(".kicad_sch"):
+        tmp_path = target + ".tmp"
+        with open(tmp_path, "wb") as out:
+            out.write(data)
+        # Re-validate the .tmp (defense-in-depth — bit-rot in the tmp fs).
+        with open(tmp_path, "rb") as fh:
+            tmp_bytes = fh.read()
+        validate_schematic_bytes(tmp_bytes, source=tmp_path)
+        os.replace(tmp_path, target)
+    else:
+        with open(target, "wb") as out:
+            out.write(data)
+
+
 def restore_project_version(project_file: str, version_id: str) -> dict[str, Any]:
     """Restore the project files to a previously saved project version.
 
@@ -202,12 +224,22 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
     consistent state.  Before overwriting, the current file set is itself
     archived (so the restore is undoable via the returned backup id).
 
+    Corruption protection: every archived ``.kicad_sch`` member is validated
+    structurally in a first pass *before* any project file is written, so a
+    corrupt snapshot cannot leave the project half-restored.  Each schematic
+    member is then written atomically (``.tmp`` + re-validation +
+    ``os.replace``).  A malformed snapshot raises
+    :class:`kcaa.utils.schematic_sexp_utils.SchematicCorruptionError` and
+    leaves the live files untouched.
+
     :param project_file: Absolute path to the project file (.kicad_pro).
     :param version_id: The ``id`` value returned by :func:`list_project_versions`.
     :returns: Dict with keys ``restored_from`` (version_id),
               ``backup_of_current`` (archive path taken before restore),
               ``backup_version_id`` and ``files`` (relative paths restored).
     :raises FileNotFoundError: If *project_file* or the requested archive does not exist.
+    :raises kcaa.utils.schematic_sexp_utils.SchematicCorruptionError: If an
+        archived schematic member is malformed.
     :raises OSError: If the extraction fails.
     """
     project_file = os.path.abspath(project_file)
@@ -226,8 +258,14 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
     backup_path = save_project_version(project_file)
     backup_version_id = project_version_id(backup_path, project_file)
 
-    restored: list[str] = []
+    from kcaa.utils.schematic_sexp_utils import validate_schematic_bytes
+
     project_dir = os.path.dirname(project_file)
+
+    # Read every archived member up front (skipping the manifest and any
+    # path-traversal members) so we can validate the .kicad_sch members
+    # BEFORE touching any live project file.
+    members: list[tuple[str, bytes]] = []
     with tarfile.open(archive_path, "r:gz") as tar:
         for member in tar.getmembers():
             if member.name == ".manifest.json" or not member.isfile():
@@ -237,10 +275,21 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
             fh = tar.extractfile(member)
             if fh is None:
                 continue
-            target = os.path.join(project_dir, member.name)
-            with open(target, "wb") as out:
-                shutil.copyfileobj(fh, out)
-            restored.append(member.name)
+            members.append((member.name, fh.read()))
+
+    # First pass: validate every archived .kicad_sch member before writing
+    # any project file.  A corrupt snapshot aborts here, leaving the live
+    # files untouched.
+    for name, data in members:
+        if name.endswith(".kicad_sch"):
+            validate_schematic_bytes(data, source=f"{archive_path}:{name}")
+
+    # Second pass: write each member, atomically for .kicad_sch members.
+    restored: list[str] = []
+    for name, data in members:
+        target = os.path.join(project_dir, name)
+        _restore_member(target, data, validate_schematic_bytes)
+        restored.append(name)
 
     return {
         "restored_from": version_id,

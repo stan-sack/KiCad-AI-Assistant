@@ -63,11 +63,17 @@ def mock_ctx():
 # ---------------------------------------------------------------------------
 
 
+# Valid .kicad_sch stubs — restore_project_version validates archived schematic
+# members structurally, so the fixtures must parse as (kicad_sch …).
+_SCH_V1 = '(kicad_sch (version 20240101) (paper "A"))\n'
+_SCH_V2 = '(kicad_sch (version 20240102) (paper "A"))\n'
+
+
 def _make_project(tmp_path, name: str = "board") -> str:
     """Create a minimal KiCad project (pro + sch + pcb) and return the pro path."""
     pro = tmp_path / f"{name}.kicad_pro"
     pro.write_text(json.dumps({"meta": {"filename": f"{name}.kicad_pro", "version": 1}}))
-    (tmp_path / f"{name}.kicad_sch").write_text("kicad_sch v1\n")
+    (tmp_path / f"{name}.kicad_sch").write_text(_SCH_V1)
     (tmp_path / f"{name}.kicad_pcb").write_text("kicad_pcb v1\n")
     return str(pro)
 
@@ -227,7 +233,7 @@ class TestRestoreProjectVersion:
         r = _run(save(pro, ctx=None))
 
         # Mutate all three files
-        (tmp_path / "board.kicad_sch").write_text("kicad_sch v2\n")
+        (tmp_path / "board.kicad_sch").write_text(_SCH_V2)
         (tmp_path / "board.kicad_pcb").write_text("kicad_pcb v2\n")
         pro_file = tmp_path / "board.kicad_pro"
         pro_file.write_text(json.dumps({"meta": {"filename": "board.kicad_pro", "version": 2}}))
@@ -239,7 +245,7 @@ class TestRestoreProjectVersion:
         assert set(result["files"]) == {"board.kicad_pro", "board.kicad_sch", "board.kicad_pcb"}
         assert "backup_of_current" in result
         assert "backup_version_id" in result
-        assert (tmp_path / "board.kicad_sch").read_text() == "kicad_sch v1\n"
+        assert (tmp_path / "board.kicad_sch").read_text() == _SCH_V1
         assert (tmp_path / "board.kicad_pcb").read_text() == "kicad_pcb v1\n"
         assert json.loads(pro_file.read_text())["meta"]["version"] == 1
 
@@ -249,14 +255,14 @@ class TestRestoreProjectVersion:
         save = self.tools["save_project_version"]
         r = _run(save(pro, ctx=None))
 
-        (tmp_path / "board.kicad_sch").write_text("kicad_sch v2\n")
+        (tmp_path / "board.kicad_sch").write_text(_SCH_V2)
         result = _run(self.fn(pro, r["version_id"], ctx=None))
-        assert (tmp_path / "board.kicad_sch").read_text() == "kicad_sch v1\n"
+        assert (tmp_path / "board.kicad_sch").read_text() == _SCH_V1
 
         # Undo: restore back to the pre-restore state
         undo = _run(self.fn(pro, result["backup_version_id"], ctx=None))
         assert undo["success"] is True
-        assert (tmp_path / "board.kicad_sch").read_text() == "kicad_sch v2\n"
+        assert (tmp_path / "board.kicad_sch").read_text() == _SCH_V2
 
     def test_restore_unknown_version(self, tmp_path):
         """Unknown version id -> error."""

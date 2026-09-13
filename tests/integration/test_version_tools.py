@@ -170,7 +170,7 @@ def _make_project(tmp_path, name: str = "board") -> str:
     """Create a minimal KiCad project (pro + sch + pcb) and return the pro path."""
     pro = tmp_path / f"{name}.kicad_pro"
     pro.write_text(json.dumps({"meta": {"filename": f"{name}.kicad_pro", "version": 1}}))
-    (tmp_path / f"{name}.kicad_sch").write_text("sch v1\n")
+    (tmp_path / f"{name}.kicad_sch").write_text('(kicad_sch (version 20240101) (paper "A"))\n')
     (tmp_path / f"{name}.kicad_pcb").write_text("pcb v1\n")
     return str(pro)
 
@@ -236,7 +236,7 @@ class TestRestoreProjectVersion:
 
         pro_path = tmp_path / "board.kicad_pro"
         pro_path.write_text(json.dumps({"meta": {"filename": "board.kicad_pro", "version": 2}}))
-        (tmp_path / "board.kicad_sch").write_text("sch v2\n")
+        (tmp_path / "board.kicad_sch").write_text('(kicad_sch (version 20240102) (paper "A"))\n')
         (tmp_path / "board.kicad_pcb").write_text("pcb v2\n")
 
         restored = _call_tool(
@@ -252,7 +252,7 @@ class TestRestoreProjectVersion:
             "board.kicad_sch",
             "board.kicad_pcb",
         }
-        assert (tmp_path / "board.kicad_sch").read_text() == "sch v1\n"
+        assert (tmp_path / "board.kicad_sch").read_text() == '(kicad_sch (version 20240101) (paper "A"))\n'
         assert (tmp_path / "board.kicad_pcb").read_text() == "pcb v1\n"
         assert json.loads(pro_path.read_text())["meta"]["version"] == 1
 
