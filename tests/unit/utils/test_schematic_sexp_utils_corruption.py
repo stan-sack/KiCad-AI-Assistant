@@ -458,7 +458,7 @@ class TestUserReportedCorruptionPatterns:
 
 
 class TestRestoreProjectVersionValidation:
-    """``restore_project_version`` must not propagate corruption from a bad archive."""
+    """``restore_project_version`` warns on corrupt archives but still restores."""
 
     @staticmethod
     def _make_project(tmp_path, name="board"):
@@ -498,9 +498,8 @@ class TestRestoreProjectVersionValidation:
                 tar.addfile(info, io.BytesIO(data))
         return archive_path
 
-    def test_restore_rejects_truncated_snapshot(self, tmp_path):
+    def test_restore_warns_on_truncated_snapshot(self, tmp_path):
         from kcaa.utils.version_manager import restore_project_version
-        from kcaa.utils.schematic_sexp_utils import SchematicCorruptionError
 
         pro, sch = self._make_project(tmp_path)
         self._make_archive(
@@ -510,18 +509,17 @@ class TestRestoreProjectVersionValidation:
             b'(kicad_sch (version 20240101) (paper "A4"',
         )
 
-        original = sch.read_bytes()
-        with pytest.raises(SchematicCorruptionError, match="unclosed parens"):
-            restore_project_version(pro, "bad_snapshot")
+        result = restore_project_version(pro, "bad_snapshot")
 
-        # Live file must be untouched.
-        assert sch.read_bytes() == original
-        # No .tmp staging file left behind.
-        assert not (sch.parent / (sch.name + ".tmp")).exists()
+        # Restore succeeds with a warning.
+        assert result["restored_from"] == "bad_snapshot"
+        assert "warning" in result
+        assert "unclosed parens" in result["warning"]
+        # Live file IS updated (the truncated snapshot is restored).
+        assert sch.read_bytes() == b'(kicad_sch (version 20240101) (paper "A4"'
 
-    def test_restore_rejects_mid_element_truncation(self, tmp_path):
+    def test_restore_warns_on_mid_element_truncation(self, tmp_path):
         from kcaa.utils.version_manager import restore_project_version
-        from kcaa.utils.schematic_sexp_utils import SchematicCorruptionError
 
         pro, sch = self._make_project(tmp_path)
         self._make_archive(
@@ -532,10 +530,13 @@ class TestRestoreProjectVersionValidation:
             b"(wire (pts (xy 0 0) (xy 10 0)) (stroke (wi",
         )
 
-        original = sch.read_bytes()
-        with pytest.raises(SchematicCorruptionError, match=r"unclosed parens"):
-            restore_project_version(pro, "mid")
-        assert sch.read_bytes() == original
+        result = restore_project_version(pro, "mid")
+        assert result["restored_from"] == "mid"
+        assert "warning" in result
+        assert sch.read_bytes() == (
+            b'(kicad_sch (version 20240101) (generator "eeschema") '
+            b"(wire (pts (xy 0 0) (xy 10 0)) (stroke (wi"
+        )
 
     def test_restore_accepts_valid_snapshot(self, tmp_path):
         from kcaa.utils.version_manager import restore_project_version
@@ -550,6 +551,7 @@ class TestRestoreProjectVersionValidation:
 
         result = restore_project_version(pro, "good")
         assert result["restored_from"] == "good"
+        assert "warning" not in result
         assert sch.read_bytes() == b'(kicad_sch (version 20240901) (paper "B"))'
 
     def test_restore_non_schematic_member_skips_validation(self, tmp_path):
@@ -573,5 +575,6 @@ class TestRestoreProjectVersionValidation:
 
         result = restore_project_version(pro, "pcb_extra")
         assert result["restored_from"] == "pcb_extra"
+        assert "warning" not in result
         # The .kicad_pcb member is written verbatim — no validation.
         assert pcb.read_bytes() == b"not an s-expression at all (unbalanced"

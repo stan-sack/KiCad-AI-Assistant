@@ -271,7 +271,7 @@ class TestCliArgs:
 # ---------------------------------------------------------------------------
 
 
-# Minimal valid 1×1 PNG (transparent) — written by the mocked cairosvg
+# Minimal valid 1×1 PNG (transparent) — written by the mocked _svg_to_png
 # so _load_image can find the file and Pillow can decode it.
 import base64 as _base64
 _PNG_1X1 = _base64.b64decode(
@@ -286,7 +286,7 @@ class TestDelivery:
         runner = _fake_kicad_cli()
         with patch(
             "kcaa.tools.image_tools.run_kicad_command_async", runner
-        ), patch("kcaa.tools.image_tools.cairosvg.svg2png") as convert:
+        ), patch("kcaa.tools.image_tools._svg_to_png") as convert:
             out_path = os.path.join(tmp_output_dir, "out.svg")
             result = await tools["render_image"](
                 kind="symbol",
@@ -304,15 +304,15 @@ class TestDelivery:
     async def test_png_default_converts_svg(self, tools, tmp_output_dir):
         runner = _fake_kicad_cli()
 
-        def _fake_svg_to_png(**kwargs):
-            """Mimic cairosvg by writing a valid 1×1 PNG to write_to."""
-            with open(kwargs["write_to"], "wb") as f:
+        def _fake_svg_to_png(svg_path, png_path, output_width=None, background_color=None):
+            """Mimic the pure-Python renderer by writing a valid 1×1 PNG."""
+            with open(png_path, "wb") as f:
                 f.write(_PNG_1X1)
 
         with patch(
             "kcaa.tools.image_tools.run_kicad_command_async", runner
         ), patch(
-            "kcaa.tools.image_tools.cairosvg.svg2png",
+            "kcaa.tools.image_tools._svg_to_png",
             side_effect=_fake_svg_to_png,
         ) as convert:
             out_path = os.path.join(tmp_output_dir, "out.png")

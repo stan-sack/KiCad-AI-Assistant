@@ -11,10 +11,13 @@ from datetime import datetime
 import hashlib
 import io
 import json
+import logging
 import os
 import shutil
 import tarfile
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 _VERSIONS_DIR = ".versions"
 MAX_PROJECT_VERSIONS = 10
@@ -194,22 +197,17 @@ def list_project_versions(project_file: str) -> list[dict[str, Any]]:
     return result
 
 
-def _restore_member(target: str, data: bytes, validate_schematic_bytes) -> None:
+def _restore_member(target: str, data: bytes) -> None:
     """Write *data* to *target*, atomically for ``.kicad_sch`` members.
 
-    ``.kicad_sch`` members are staged to a ``.tmp`` sibling, validated again,
-    and only then ``os.replace``d over the live file, so a mid-write failure
-    cannot leave the schematic half-overwritten.  Non-schematic members use a
-    plain write.
+    ``.kicad_sch`` members are staged to a ``.tmp`` sibling and only then
+    ``os.replace``d over the live file, so a mid-write failure cannot leave
+    the schematic half-overwritten.  Non-schematic members use a plain write.
     """
     if target.endswith(".kicad_sch"):
         tmp_path = target + ".tmp"
         with open(tmp_path, "wb") as out:
             out.write(data)
-        # Re-validate the .tmp (defense-in-depth — bit-rot in the tmp fs).
-        with open(tmp_path, "rb") as fh:
-            tmp_bytes = fh.read()
-        validate_schematic_bytes(tmp_bytes, source=tmp_path)
         os.replace(tmp_path, target)
     else:
         with open(target, "wb") as out:
@@ -225,21 +223,21 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
     archived (so the restore is undoable via the returned backup id).
 
     Corruption protection: every archived ``.kicad_sch`` member is validated
-    structurally in a first pass *before* any project file is written, so a
-    corrupt snapshot cannot leave the project half-restored.  Each schematic
-    member is then written atomically (``.tmp`` + re-validation +
-    ``os.replace``).  A malformed snapshot raises
-    :class:`kcaa.utils.schematic_sexp_utils.SchematicCorruptionError` and
-    leaves the live files untouched.
+    structurally in a first pass *before* any project file is written.  If
+    validation fails, a warning is logged but the restore proceeds anyway —
+    the user explicitly requested this version, and version restore is the
+    primary recovery path for corrupt files.  The result dict includes a
+    ``warning`` key when this happens.  Each schematic member is then written
+    atomically (``.tmp`` + ``os.replace``).
 
     :param project_file: Absolute path to the project file (.kicad_pro).
     :param version_id: The ``id`` value returned by :func:`list_project_versions`.
     :returns: Dict with keys ``restored_from`` (version_id),
               ``backup_of_current`` (archive path taken before restore),
-              ``backup_version_id`` and ``files`` (relative paths restored).
+              ``backup_version_id``, ``files`` (relative paths restored), and
+              optionally ``warning`` (str) if an archived schematic member
+              failed structural validation.
     :raises FileNotFoundError: If *project_file* or the requested archive does not exist.
-    :raises kcaa.utils.schematic_sexp_utils.SchematicCorruptionError: If an
-        archived schematic member is malformed.
     :raises OSError: If the extraction fails.
     """
     project_file = os.path.abspath(project_file)
@@ -258,7 +256,10 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
     backup_path = save_project_version(project_file)
     backup_version_id = project_version_id(backup_path, project_file)
 
-    from kcaa.utils.schematic_sexp_utils import validate_schematic_bytes
+    from kcaa.utils.schematic_sexp_utils import (
+        SchematicCorruptionError,
+        validate_schematic_bytes,
+    )
 
     project_dir = os.path.dirname(project_file)
 
@@ -278,22 +279,34 @@ def restore_project_version(project_file: str, version_id: str) -> dict[str, Any
             members.append((member.name, fh.read()))
 
     # First pass: validate every archived .kicad_sch member before writing
-    # any project file.  A corrupt snapshot aborts here, leaving the live
-    # files untouched.
+    # any project file.  Validation failure warns but does not block — the
+    # restore is the primary recovery path for corrupt files.
+    warnings: list[str] = []
     for name, data in members:
         if name.endswith(".kicad_sch"):
-            validate_schematic_bytes(data, source=f"{archive_path}:{name}")
+            try:
+                validate_schematic_bytes(data, source=f"{archive_path}:{name}")
+            except SchematicCorruptionError as exc:
+                warning = (
+                    f"Archived member {name} failed structural validation: {exc}. "
+                    "Restoring anyway — open in KiCad to verify."
+                )
+                log.warning(warning)
+                warnings.append(warning)
 
     # Second pass: write each member, atomically for .kicad_sch members.
     restored: list[str] = []
     for name, data in members:
         target = os.path.join(project_dir, name)
-        _restore_member(target, data, validate_schematic_bytes)
+        _restore_member(target, data)
         restored.append(name)
 
-    return {
+    result: dict[str, Any] = {
         "restored_from": version_id,
         "backup_of_current": backup_path,
         "backup_version_id": backup_version_id,
         "files": sorted(restored),
     }
+    if warnings:
+        result["warning"] = "; ".join(warnings)
+    return result
