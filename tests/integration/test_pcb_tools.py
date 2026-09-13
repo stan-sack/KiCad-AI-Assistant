@@ -259,50 +259,62 @@ class TestGetFootprint:
     def test_value_and_reference(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        assert result.get("reference") == "R1"
-        assert result.get("value") == "10k"
+        assert result["results"][0].get("reference") == "R1"
+        assert result["results"][0].get("value") == "10k"
 
     def test_pad_count(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        assert len(result.get("pads", [])) == 2
+        assert len(result["results"][0].get("pads", [])) == 2
 
     def test_pad_net_name(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        pad1 = next(p for p in result["pads"] if p["number"] == "1")
+        pad1 = next(p for p in result["results"][0]["pads"] if p["number"] == "1")
         assert pad1["net_name"] == "VCC"
 
     def test_pad_coords_are_local(self, mcp_server):
         """Pads expose local_x/local_y (footprint-relative), not world coords."""
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        pad1 = next(p for p in result["pads"] if p["number"] == "1")
+        pad1 = next(p for p in result["results"][0]["pads"] if p["number"] == "1")
         assert "local_x" in pad1
         assert "local_y" in pad1
 
     def test_missing_reference_returns_error(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "U99"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["U99"]}
         )
-        assert "error" in result
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][0]
 
     def test_includes_edge_cuts_field(self, mcp_server):
         """get_footprint response carries an edge_cuts list over JSON-RPC."""
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        assert isinstance(result.get("edge_cuts"), list)
+        assert isinstance(result["results"][0].get("edge_cuts"), list)
+
+    def test_batch_returns_multiple(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1", "C1"]}
+        )
+        assert result.get("success") is True, result
+        assert result["count"] == 2
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][1]["reference"] == "C1"
+        assert result["results"][1]["value"] == "100nF"
 
 
 class TestListNets:
@@ -370,15 +382,12 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
-                "x": 50.0,
-                "y": 60.0,
-                "rotation": None,
+                "items": [{"reference": "R1", "x": 50.0, "y": 60.0}],
             },
         )
         assert "error" not in result, result
-        assert abs(result["placed_at"]["x"] - 50.0) < 0.001
-        assert abs(result["placed_at"]["y"] - 60.0) < 0.001
+        assert abs(result["results"][0]["placed_at"]["x"] - 50.0) < 0.001
+        assert abs(result["results"][0]["placed_at"]["y"] - 60.0) < 0.001
 
     def test_preserves_unchanged_axis(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -390,15 +399,12 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
-                "x": 99.0,
-                "y": None,
-                "rotation": None,
+                "items": [{"reference": "R1", "x": 99.0}],
             },
         )
         assert "error" not in result
         # y must be unchanged from fixture value (20.0)
-        assert abs(result["placed_at"]["y"] - 20.0) < 0.001
+        assert abs(result["results"][0]["placed_at"]["y"] - 20.0) < 0.001
 
     def test_creates_backup_file(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -410,10 +416,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
-                "x": 1.0,
-                "y": 1.0,
-                "rotation": None,
+                "items": [{"reference": "R1", "x": 1.0, "y": 1.0}],
             },
         )
         assert "error" not in result
@@ -430,15 +433,88 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
-                "x": 5.0,
-                "y": 5.0,
-                "rotation": None,
+                "items": [{"reference": "R1", "x": 5.0, "y": 5.0}],
             },
         )
         assert "error" not in result
-        assert abs(result["moved_from"]["x"] - 10.0) < 0.001
-        assert abs(result["moved_from"]["y"] - 20.0) < 0.001
+        assert abs(result["results"][0]["moved_from"]["x"] - 10.0) < 0.001
+        assert abs(result["results"][0]["moved_from"]["y"] - 20.0) < 0.001
+
+    def test_moves_multiple_footprints(self, mcp_server, tmp_path):
+        port, sid = mcp_server
+        pcb = tmp_path / "board.kicad_pcb"
+        shutil.copy2(BOARD_FIXTURE, pcb)
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "items": [
+                    {"reference": "R1", "x": 33.0, "y": 44.0},
+                    {"reference": "C1", "x": 61.0, "y": 72.0},
+                ],
+            },
+        )
+        assert result.get("success") is True, result
+        assert result["applied_count"] == 2
+        assert result["failure_count"] == 0
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][1]["reference"] == "C1"
+        assert abs(result["results"][0]["placed_at"]["x"] - 33.0) < 0.001
+        assert abs(result["results"][0]["placed_at"]["y"] - 44.0) < 0.001
+        assert abs(result["results"][1]["placed_at"]["x"] - 61.0) < 0.001
+        assert abs(result["results"][1]["placed_at"]["y"] - 72.0) < 0.001
+
+    def test_partial_apply_reports_per_ref_errors(self, mcp_server, tmp_path):
+        port, sid = mcp_server
+        pcb = tmp_path / "board.kicad_pcb"
+        shutil.copy2(BOARD_FIXTURE, pcb)
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "items": [
+                    {"reference": "R1", "x": 99.0, "y": 88.0},
+                    {"reference": "U99", "x": 99.0, "y": 88.0},
+                ],
+            },
+        )
+        assert result.get("success") is False
+        assert result["applied_count"] == 1
+        assert result["failure_count"] == 1
+        placed = result["results"][0]
+        assert placed.get("success") is True
+        assert abs(placed["placed_at"]["x"] - 99.0) < 0.001
+        failed = result["results"][1]
+        assert "error" in failed
+        assert "U99" in failed["error"]
+        # The successful target really was saved: re-read through the MCP.
+        reread = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": str(pcb), "references": ["R1"]}
+        )
+        assert abs(reread["results"][0]["x"] - 99.0) < 0.001
+
+    def test_duplicate_references_rejected(self, mcp_server, tmp_path):
+        port, sid = mcp_server
+        pcb = tmp_path / "board.kicad_pcb"
+        shutil.copy2(BOARD_FIXTURE, pcb)
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "items": [
+                    {"reference": "R1", "x": 1.0, "y": 1.0},
+                    {"reference": "R1", "x": 1.0, "y": 1.0},
+                ],
+            },
+        )
+        assert "error" in result
+        assert "duplicate" in result["error"]
 
     def test_missing_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -450,13 +526,13 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "U99",
-                "x": 1.0,
-                "y": 1.0,
-                "rotation": None,
+                "items": [{"reference": "U99", "x": 1.0, "y": 1.0}],
             },
         )
-        assert "error" in result
+        assert result.get("success") is False, result
+        assert result["results"][0]["reference"] == "U99"
+        assert "error" in result["results"][0]
+        assert result["applied_count"] == 0
 
     def test_no_args_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -468,10 +544,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
-                "x": None,
-                "y": None,
-                "rotation": None,
+                "items": [{"reference": "R1"}],
             },
         )
         assert "error" in result
@@ -556,14 +629,12 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
-                "property_name": "Value",
-                "value": "22k",
+                "items": [{"reference": "R1", "property_name": "Value", "value": "22k"}],
             },
         )
         assert "error" not in result, result
-        assert result.get("new_value") == "22k"
-        assert result.get("previous_value") == "10k"
+        assert result["results"][0]["new_value"] == "22k"
+        assert result["results"][0]["previous_value"] == "10k"
 
     def test_update_persists_to_file(self, mcp_server, tmp_path):
         """After set, re-reading the PCB should reflect the new value."""
@@ -576,13 +647,13 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
-                "property_name": "Value",
-                "value": "47k",
+                "items": [{"reference": "R1", "property_name": "Value", "value": "47k"}],
             },
         )
-        result = _call_tool(port, sid, "get_footprint", {"pcb_path": str(pcb), "reference": "R1"})
-        assert result.get("value") == "47k"
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": str(pcb), "references": ["R1"]}
+        )
+        assert result["results"][0].get("value") == "47k"
 
     def test_missing_property_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -594,12 +665,12 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
-                "property_name": "NonExistentProp",
-                "value": "x",
+                "items": [{"reference": "R1", "property_name": "NonExistentProp", "value": "x"}],
             },
         )
-        assert "error" in result
+        assert result.get("success") is False, result
+        assert "error" in result["results"][0]
+        assert "NonExistentProp" in result["results"][0]["error"]
 
     def test_missing_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -611,12 +682,34 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "reference": "U99",
-                "property_name": "Value",
-                "value": "x",
+                "items": [{"reference": "U99", "property_name": "Value", "value": "x"}],
             },
         )
-        assert "error" in result
+        assert result.get("success") is False, result
+        assert result["results"][0]["reference"] == "U99"
+        assert "error" in result["results"][0]
+
+    def test_different_values_per_item(self, mcp_server, tmp_path):
+        """Each items entry sets its own property value."""
+        port, sid = mcp_server
+        pcb = tmp_path / "board.kicad_pcb"
+        shutil.copy2(BOARD_FIXTURE, pcb)
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_property",
+            {
+                "pcb_path": str(pcb),
+                "items": [
+                    {"reference": "R1", "property_name": "Value", "value": "22k"},
+                    {"reference": "C1", "property_name": "Value", "value": "33n"},
+                ],
+            },
+        )
+        assert result.get("success") is True, result
+        assert result["applied_count"] == 2
+        assert result["results"][0]["new_value"] == "22k"
+        assert result["results"][1]["new_value"] == "33n"
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +726,7 @@ class TestSyncFootprintIndex:
             "sync_footprint_index",
             {
                 "force": False,
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert result.get("status") in ("started", "already_running"), (
@@ -651,7 +744,7 @@ class TestSyncFootprintIndex:
             "sync_footprint_index",
             {
                 "force": True,
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert result.get("status") in ("started", "already_running")
@@ -692,7 +785,7 @@ class TestListFootprintLibraries:
             sid,
             "list_footprint_libraries",
             {
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert "libraries" in result
@@ -705,7 +798,7 @@ class TestListFootprintLibraries:
             sid,
             "list_footprint_libraries",
             {
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert result["count"] == len(result["libraries"])
@@ -717,7 +810,7 @@ class TestListFootprintLibraries:
             sid,
             "list_footprint_libraries",
             {
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert "error" not in result
@@ -732,7 +825,7 @@ class TestSearchFootprints:
             "search_footprints",
             {
                 "query": "resistor",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
                 "max_results": 5,
             },
         )
@@ -746,7 +839,7 @@ class TestSearchFootprints:
             "search_footprints",
             {
                 "query": "capacitor",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
                 "max_results": 5,
             },
         )
@@ -760,7 +853,7 @@ class TestSearchFootprints:
             "search_footprints",
             {
                 "query": "",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
                 "max_results": 5,
             },
         )
@@ -774,7 +867,7 @@ class TestSearchFootprints:
             "search_footprints",
             {
                 "query": "R_0402",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
                 "max_results": 3,
             },
         )
@@ -793,7 +886,7 @@ class TestGetFootprintDetails:
             {
                 "library_name": "__nonexistent_lib__",
                 "footprint_name": "R_0402",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert "error" in result
@@ -808,7 +901,7 @@ class TestGetFootprintDetails:
             {
                 "library_name": "Resistor_SMD",
                 "footprint_name": "__nonexistent_footprint__",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert "error" in result

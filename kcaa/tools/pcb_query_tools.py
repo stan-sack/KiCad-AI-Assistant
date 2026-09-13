@@ -194,8 +194,12 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def list_footprints(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
-        """List all footprints placed on a KiCad PCB board.
+    async def list_footprints(
+        pcb_path: str,
+        ctx: Context | None,
+        ref_prefix: str | None = None,
+    ) -> dict[str, Any]:
+        """List footprints placed on a KiCad PCB board, optionally filtered.
 
         PCB coordinate convention (used by every PCB tool): millimetres,
         +X right, **+Y down** (KiCad PCB front-view coords), and rotation
@@ -206,12 +210,18 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             ctx: MCP context for progress reporting.
+            ref_prefix: Only footprints whose reference starts with this
+                prefix (e.g. ``"R"`` for resistors, ``"J"`` for
+                connectors).
 
         Returns:
             dict with footprints: list of {reference, value, x, y (mm,
             world), rotation (deg, CCW+), layer (e.g. "F.Cu"/"B.Cu")},
             count.
         """
+        if ref_prefix is not None and not isinstance(ref_prefix, str):
+            return {"error": "ref_prefix must be a string"}
+
         data = load_pcb(pcb_path)
         footprints = []
 
@@ -219,9 +229,12 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
                 continue
             ref = get_fp_property(item, "Reference") or ""
+            if ref_prefix is not None and not ref.startswith(ref_prefix):
+                continue
             value = get_fp_property(item, "Value") or ""
             x, y, rot = get_fp_at(item)
             layer = get_fp_layer(item) or ""
+
             footprints.append(
                 {
                     "reference": ref,
@@ -238,10 +251,10 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def get_footprint(
         pcb_path: str,
-        reference: str,
+        references: list[str],
         ctx: Context | None,
     ) -> dict[str, Any]:
-        """Get detailed information about a specific footprint on the board.
+        """Get detailed information about one or more footprints on the board.
 
         Coordinates are mm, +Y down; rotation is CCW-positive on screen
         (KiCad PCB convention: 0=right, 90=up). The footprint's
@@ -260,11 +273,14 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            reference: Footprint reference designator, e.g. ``"R1"``.
+            references: Footprint reference designators, e.g. ``["R1",
+                "C1"]``.  Must be non-empty and unique.
             ctx: MCP context for progress reporting.
 
         Returns:
-            dict with reference, value, x/y/rotation (world, mm/deg CCW+),
+            dict with success (bool — every reference found), results
+            (list of per-footprint payloads, each with reference, value,
+            x/y/rotation (world, mm/deg CCW+),
             layer, properties (dict of all property name→value), pads
             (list of {number, type, shape, local_x, local_y,
              local_w, local_h, world_w, world_h, net_name}),
@@ -275,85 +291,104 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
              stores pad rotation as absolute board-space angle in the same
              CCW convention).
         """
+        if not references:
+            return {"error": "references must not be empty"}
+        if any(not isinstance(r, str) or not r for r in references):
+            return {"error": "references must not contain empty designators"}
+        if len(set(references)) != len(references):
+            return {"error": "references must not contain duplicates"}
+
         data = load_pcb(pcb_path)
-        try:
-            fp = find_footprint(data, reference)
-        except KeyError as exc:
-            return {"error": str(exc)}
 
-        x, y, rot = get_fp_at(fp)
-        layer = get_fp_layer(fp) or ""
+        def detail_one(ref: str) -> dict[str, Any]:
+            try:
+                fp = find_footprint(data, ref)
+            except KeyError as exc:
+                return {"reference": ref, "error": str(exc)}
 
-        # Collect all properties
-        props: dict[str, str] = {}
-        for sub in fp:
-            if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-                name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
-                val = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
-                props[name] = val
+            x, y, rot = get_fp_at(fp)
+            layer = get_fp_layer(fp) or ""
 
-        # Collect pads
-        pads = []
-        for sub in fp:
-            if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
-                continue
-            pad_num = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
-            pad_type = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
-            pad_shape = sub[3] if isinstance(sub[3], str) else _sym(sub[3])
-            pad_x, pad_y = 0.0, 0.0
-            pad_rot = 0.0
-            pad_w, pad_h = 0.0, 0.0
-            net_name = ""
-            for psub in sub:
-                if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
-                    pad_x, pad_y = float(psub[1]), float(psub[2])
-                    pad_rot = float(psub[3]) if len(psub) > 3 else 0.0
-                elif isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "size":
-                    pad_w, pad_h = float(psub[1]), float(psub[2])
-                elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
-                    _, net_name = _parse_net_ref(psub, {}, {})
-            # World-oriented size.
-            # Pad rotation in KiCad 10 is stored as absolute board-space
-            # (same CCW convention as the footprint), so we use it directly
-            # without adding fp rotation.
-            if abs(pad_rot % 180.0 - 90.0) < 0.1:
-                wworld, hworld = pad_h, pad_w
-            else:
-                wworld, hworld = pad_w, pad_h
-            pads.append(
-                {
-                    "number": str(pad_num),
-                    "type": str(pad_type),
-                    "shape": str(pad_shape),
-                    "local_x": pad_x,
-                    "local_y": pad_y,
-                    "local_w": pad_w,
-                    "local_h": pad_h,
-                    "world_w": wworld,
-                    "world_h": hworld,
-                    "net_name": net_name,
-                }
-            )
+            # Collect all properties
+            props: dict[str, str] = {}
+            for sub in fp:
+                if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
+                    name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                    val = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                    props[name] = val
 
+            # Collect pads
+            pads = []
+            for sub in fp:
+                if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
+                    continue
+                pad_num = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                pad_type = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                pad_shape = sub[3] if isinstance(sub[3], str) else _sym(sub[3])
+                pad_x, pad_y = 0.0, 0.0
+                pad_rot = 0.0
+                pad_w, pad_h = 0.0, 0.0
+                net_name = ""
+                for psub in sub:
+                    if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
+                        pad_x, pad_y = float(psub[1]), float(psub[2])
+                        pad_rot = float(psub[3]) if len(psub) > 3 else 0.0
+                    elif isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "size":
+                        pad_w, pad_h = float(psub[1]), float(psub[2])
+                    elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
+                        _, net_name = _parse_net_ref(psub, {}, {})
+                # World-oriented size.
+                # Pad rotation in KiCad 10 is stored as absolute board-space
+                # (same CCW convention as the footprint), so we use it directly
+                # without adding fp rotation.
+                if abs(pad_rot % 180.0 - 90.0) < 0.1:
+                    wworld, hworld = pad_h, pad_w
+                else:
+                    wworld, hworld = pad_w, pad_h
+                pads.append(
+                    {
+                        "number": str(pad_num),
+                        "type": str(pad_type),
+                        "shape": str(pad_shape),
+                        "local_x": pad_x,
+                        "local_y": pad_y,
+                        "local_w": pad_w,
+                        "local_h": pad_h,
+                        "world_w": wworld,
+                        "world_h": hworld,
+                        "net_name": net_name,
+                    }
+                )
+
+            return {
+                "reference": ref,
+                "value": props.get("Value", ""),
+                "x": x,
+                "y": y,
+                "rotation": rot,
+                "layer": layer,
+                "properties": props,
+                "pads": pads,
+                "edge_cuts": get_fp_edge_cuts_items(fp),
+            }
+
+        results = [detail_one(ref) for ref in references]
+        failure_count = sum(1 for r in results if "error" in r)
         return {
-            "reference": reference,
-            "value": props.get("Value", ""),
-            "x": x,
-            "y": y,
-            "rotation": rot,
-            "layer": layer,
-            "properties": props,
-            "pads": pads,
-            "edge_cuts": get_fp_edge_cuts_items(fp),
+            "success": failure_count == 0,
+            "results": results,
+            "count": len(results),
+            "failure_count": failure_count,
         }
 
     @mcp.tool()
     async def get_footprint_bbox(
         pcb_path: str,
-        reference: str,
+        references: list[str],
         ctx: Context | None,
     ) -> dict[str, Any]:
-        """Return the world-coordinate bounding box of a footprint's courtyard.
+        """Return the world-coordinate bounding box of one or more footprints'
+        courtyards.
 
         The bounding box is computed from ``F.Courtyard`` / ``B.Courtyard``
         graphic items in the footprint, transformed to board world
@@ -368,31 +403,55 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            reference: Footprint reference designator, e.g. ``"U1"``.
+            references: Footprint reference designators, e.g. ``["U1",
+                "R2"]``.  Must be non-empty and unique.
             ctx: MCP context (unused).
 
         Returns:
-            dict with reference, x/y/rotation (anchor), bbox
-            {min_x, min_y, max_x, max_y, width, height} in world mm,
-            or ``error`` if not found / no geometry.
+            dict with success (bool — every reference found), results
+            (list of per-footprint payloads, each with reference,
+            x/y/rotation (anchor) and bbox {min_x, min_y, max_x, max_y,
+            width, height} in world mm, or ``{"reference", "error"}`` when
+            not found / no geometry), count, failure_count.
         """
+        if not references:
+            return {"error": "references must not be empty"}
+        if any(not isinstance(r, str) or not r for r in references):
+            return {"error": "references must not contain empty designators"}
+        if len(set(references)) != len(references):
+            return {"error": "references must not contain duplicates"}
+
         data = load_pcb(pcb_path)
-        try:
-            fp = find_footprint(data, reference)
-        except KeyError as exc:
-            return {"error": str(exc)}
 
-        fp_x, fp_y, fp_rot = get_fp_at(fp)
-        bbox = get_fp_courtyard_bbox(fp, fp_x, fp_y, fp_rot)
-        if bbox is None:
-            return {"error": f"No courtyard or graphic geometry found for '{reference}'."}
+        def bbox_one(ref: str) -> dict[str, Any]:
+            try:
+                fp = find_footprint(data, ref)
+            except KeyError as exc:
+                return {"reference": ref, "error": str(exc)}
 
+            fp_x, fp_y, fp_rot = get_fp_at(fp)
+            bbox = get_fp_courtyard_bbox(fp, fp_x, fp_y, fp_rot)
+            if bbox is None:
+                return {
+                    "reference": ref,
+                    "error": f"No courtyard or graphic geometry found for '{ref}'.",
+                }
+
+            return {
+                "reference": ref,
+                "x": fp_x,
+                "y": fp_y,
+                "rotation": fp_rot,
+                "bbox": bbox,
+            }
+
+        results = [bbox_one(ref) for ref in references]
+        failure_count = sum(1 for r in results if "error" in r)
         return {
-            "reference": reference,
-            "x": fp_x,
-            "y": fp_y,
-            "rotation": fp_rot,
-            "bbox": bbox,
+            "success": failure_count == 0,
+            "results": results,
+            "count": len(results),
+            "failure_count": failure_count,
         }
 
     @mcp.tool()
@@ -1323,7 +1382,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         ctx: Context | None = None,
         net: str | None = None,
     ) -> dict[str, Any]:
-        """List all through-hole vias on the PCB, optionally filtered.
+        """List through-hole vias on the PCB, optionally filtered.
 
         Returns every ``(via ...)`` entry with its position, size,
         drill, layers, and net.  When ``net`` is provided, only

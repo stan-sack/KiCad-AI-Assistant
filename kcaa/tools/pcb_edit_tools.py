@@ -309,47 +309,120 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def set_footprint_property(
         pcb_path: str,
-        reference: str,
-        property_name: str,
-        value: str,
+        items: list[dict[str, Any]],
         ctx: Context | None,
-    ) -> dict[str, str]:
-        """Update a property of a footprint on the PCB board.
+    ) -> dict[str, Any]:
+        """Update a property on footprints of the PCB board.
 
         Common property names: ``Reference``, ``Value``, ``Datasheet``,
         ``Description``.  Custom user fields are also supported.
 
-        A .kicad_pcb.bak backup is created before writing.
-        """
-        data = load_pcb(pcb_path)
-        try:
-            fp = find_footprint(data, reference)
-        except KeyError as exc:
-            return {"error": str(exc)}
+        Each item in *items* carries its own property and value
+        (``{"reference": ..., "property_name": ..., "value": ...}``).
+        All items are processed in one parse + one save (single ``.bak``).
+        Partial-apply: a footprint that cannot be found or lacks the
+        property keeps its own error in ``results`` while the remaining
+        footprints are still applied and saved.  Empty, duplicate, or
+        malformed items are rejected up front.
 
-        old_value = get_fp_property(fp, property_name)
-        if old_value is None:
+        A .kicad_pcb.bak backup is created before writing.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            items: List of per-footprint specs, e.g. ``[{"reference":
+                "R1", "property_name": "Value", "value": "22k"}]``.
+                Keys: ``reference`` (str, required, unique),
+                ``property_name`` (str, required),
+                ``value`` (str, required).
+
+        Returns:
+            dict with: results (per-footprint {reference, property_name,
+            previous_value, new_value} or {reference, error}),
+            success (all applied), count, applied_count, failure_count,
+            backup_path, pcb_path.
+        """
+        _ITEM_KEYS = {"reference", "property_name", "value"}
+        if not items:
+            return {"error": "items must not be empty"}
+        for item in items:
+            if not isinstance(item, dict):
+                return {"error": "each item must be a dict with reference, property_name, value"}
+            unknown = set(item) - _ITEM_KEYS
+            if unknown:
+                return {
+                    "error": f"Unknown item fields: {sorted(unknown)}. Valid: {sorted(_ITEM_KEYS)}"
+                }
+            ref = item.get("reference")
+            if not isinstance(ref, str) or not ref:
+                return {"error": "items must not contain empty or missing references"}
+            if not isinstance(item.get("property_name"), str) or not item["property_name"]:
+                return {"error": "items must contain a non-empty property_name"}
+            if not isinstance(item.get("value"), str):
+                return {"error": "items must contain a string value"}
+        refs = [item["reference"] for item in items]
+        if len(set(refs)) != len(refs):
+            return {"error": "items must not contain duplicate references"}
+
+        data = load_pcb(pcb_path)
+
+        def apply_one(item: dict[str, Any]) -> dict[str, Any]:
+            ref = item["reference"]
+            name = item["property_name"]
+            val = item["value"]
+            try:
+                fp = find_footprint(data, ref)
+            except KeyError as exc:
+                return {"error": str(exc), "reference": ref}
+
+            old_value = get_fp_property(fp, name)
+            if old_value is None:
+                return {
+                    "error": (
+                        f"Property '{name}' not found on footprint '{ref}'. "
+                        f"Use get_footprint to see available properties."
+                    ),
+                    "reference": ref,
+                }
+
+            updated = set_fp_property(fp, name, val)
+            if not updated:
+                return {
+                    "error": f"Failed to update property '{name}' on '{ref}'.",
+                    "reference": ref,
+                }
+
             return {
-                "error": (
-                    f"Property '{property_name}' not found on footprint '{reference}'. "
-                    f"Use get_footprint to see available properties."
-                )
+                "success": True,
+                "reference": ref,
+                "property_name": name,
+                "previous_value": old_value,
+                "new_value": val,
             }
 
-        updated = set_fp_property(fp, property_name, value)
-        if not updated:
-            return {"error": f"Failed to update property '{property_name}' on '{reference}'."}
+        results: list[dict[str, Any]] = []
+        for item in items:
+            ref = item["reference"]
+            try:
+                results.append(apply_one(item))
+            except Exception as exc:
+                log.warning("set_footprint_property: reference %r failed: %s", ref, exc)
+                results.append({"error": f"{ref}: {exc}", "reference": ref})
 
-        try:
-            backup_path = save_pcb(pcb_path, data)
-        except OSError as exc:
-            return {"error": f"Failed to write PCB file: {exc}"}
+        applied_count = sum(1 for r in results if r.get("success"))
+
+        backup_path: str | None = None
+        if applied_count > 0:
+            try:
+                backup_path = save_pcb(pcb_path, data)
+            except OSError as exc:
+                return {"error": f"Failed to write PCB file: {exc}"}
 
         return {
-            "reference": reference,
-            "property_name": property_name,
-            "previous_value": old_value,
-            "new_value": value,
+            "success": applied_count == len(results) and len(results) > 0,
+            "results": results,
+            "count": len(results),
+            "applied_count": applied_count,
+            "failure_count": len(results) - applied_count,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }

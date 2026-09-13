@@ -2,9 +2,9 @@
 Integration tests for version management MCP tools.
 
 Covers:
-  - save_file_version
-  - list_file_versions
-  - restore_file_version
+  - save_project_version
+  - list_project_versions
+  - restore_project_version
 
 The tests start a real MCP server subprocess (plugin profile) and talk
 to it over the streamable-http JSON-RPC transport.  Version snapshots
@@ -162,229 +162,107 @@ def mcp_server():
 
 
 # ---------------------------------------------------------------------------
-# Helper: create a temp file with known content
+# Tests: save_project_version / list_project_versions / restore_project_version
 # ---------------------------------------------------------------------------
 
 
-def _make_test_file(
-    tmp_path, name: str = "test.kicad_sch", content: str = "version 1 content"
-) -> str:
-    p = tmp_path / name
-    p.write_text(content)
-    return str(p)
+def _make_project(tmp_path, name: str = "board") -> str:
+    """Create a minimal KiCad project (pro + sch + pcb) and return the pro path."""
+    pro = tmp_path / f"{name}.kicad_pro"
+    pro.write_text(json.dumps({"meta": {"filename": f"{name}.kicad_pro", "version": 1}}))
+    (tmp_path / f"{name}.kicad_sch").write_text('(kicad_sch (version 20240101) (paper "A"))\n')
+    (tmp_path / f"{name}.kicad_pcb").write_text("pcb v1\n")
+    return str(pro)
 
 
-# ---------------------------------------------------------------------------
-# Tests: save_file_version
-# ---------------------------------------------------------------------------
-
-
-class TestSaveFileVersion:
-    def test_saves_version_successfully(self, mcp_server, tmp_path):
+class TestSaveProjectVersion:
+    def test_saves_project_archive(self, mcp_server, tmp_path):
         port, sid = mcp_server
-        fp = _make_test_file(tmp_path)
-        result = _call_tool(port, sid, "save_file_version", {"file_path": fp})
+        pro = _make_project(tmp_path)
+        result = _call_tool(port, sid, "save_project_version", {"project_file": pro})
         assert "error" not in result, result
         assert result.get("success") is True
         assert "version_id" in result
-        assert "snapshot_path" in result
+        assert result.get("archive_path", "").endswith(".tar.gz")
+        assert set(result.get("files", [])) == {
+            "board.kicad_pro",
+            "board.kicad_sch",
+            "board.kicad_pcb",
+        }
 
-    def test_snapshot_file_exists(self, mcp_server, tmp_path):
-        port, sid = mcp_server
-        fp = _make_test_file(tmp_path)
-        result = _call_tool(port, sid, "save_file_version", {"file_path": fp})
-        assert "error" not in result
-        snapshot = result.get("snapshot_path", "")
-        assert snapshot and os.path.isfile(snapshot), f"Snapshot not found at {snapshot!r}"
-
-    def test_multiple_saves_create_distinct_versions(self, mcp_server, tmp_path):
-        port, sid = mcp_server
-        fp = _make_test_file(tmp_path)
-        r1 = _call_tool(port, sid, "save_file_version", {"file_path": fp})
-        # Modify file before second save
-        with open(fp, "w") as f:
-            f.write("version 2 content")
-        r2 = _call_tool(port, sid, "save_file_version", {"file_path": fp})
-        assert "error" not in r1
-        assert "error" not in r2
-        assert r1["version_id"] != r2["version_id"]
-
-    def test_nonexistent_file_returns_error(self, mcp_server):
+    def test_invalid_path_returns_error(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
             port,
             sid,
-            "save_file_version",
-            {
-                "file_path": "/nonexistent/path/test.kicad_sch",
-            },
+            "save_project_version",
+            {"project_file": "/nonexistent/path/project.kicad_pro"},
         )
         assert "error" in result
 
 
-# ---------------------------------------------------------------------------
-# Tests: list_file_versions
-# ---------------------------------------------------------------------------
-
-
-class TestListFileVersions:
-    def test_lists_saved_versions(self, mcp_server, tmp_path):
+class TestListProjectVersions:
+    def test_lists_project_versions(self, mcp_server, tmp_path):
         port, sid = mcp_server
-        fp = _make_test_file(tmp_path)
-        _call_tool(port, sid, "save_file_version", {"file_path": fp})
-        result = _call_tool(port, sid, "list_file_versions", {"file_path": fp})
+        pro = _make_project(tmp_path)
+        _call_tool(port, sid, "save_project_version", {"project_file": pro})
+        result = _call_tool(port, sid, "list_project_versions", {"project_file": pro})
         assert "error" not in result, result
         assert result.get("success") is True
         assert result.get("count", 0) >= 1
-        assert len(result.get("versions", [])) >= 1
+        v = result["versions"][0]
+        assert "id" in v and "timestamp" in v and "size_bytes" in v
+        assert set(v.get("files", [])) == {
+            "board.kicad_pro",
+            "board.kicad_sch",
+            "board.kicad_pcb",
+        }
 
-    def test_version_entry_has_expected_keys(self, mcp_server, tmp_path):
+    def test_no_versions_returns_empty(self, mcp_server, tmp_path):
         port, sid = mcp_server
-        fp = _make_test_file(tmp_path)
-        _call_tool(port, sid, "save_file_version", {"file_path": fp})
-        result = _call_tool(port, sid, "list_file_versions", {"file_path": fp})
-        assert "error" not in result
-        versions = result.get("versions", [])
-        assert len(versions) >= 1
-        v = versions[0]
-        assert "id" in v
-        assert "timestamp" in v
-        assert "size_bytes" in v
-
-    def test_current_file_info_present(self, mcp_server, tmp_path):
-        port, sid = mcp_server
-        fp = _make_test_file(tmp_path)
-        result = _call_tool(port, sid, "list_file_versions", {"file_path": fp})
-        assert "error" not in result
-        current = result.get("current")
-        assert current is not None
-        assert "timestamp" in current
-        assert "size_bytes" in current
-
-    def test_no_versions_returns_empty_list(self, mcp_server, tmp_path):
-        port, sid = mcp_server
-        fp = _make_test_file(tmp_path)
-        result = _call_tool(port, sid, "list_file_versions", {"file_path": fp})
+        pro = _make_project(tmp_path)
+        result = _call_tool(port, sid, "list_project_versions", {"project_file": pro})
         assert "error" not in result
         assert result.get("count") == 0
-        assert result.get("versions") == []
 
 
-# ---------------------------------------------------------------------------
-# Tests: restore_file_version
-# ---------------------------------------------------------------------------
-
-
-class TestRestoreFileVersion:
-    def test_restore_reverts_file_content(self, mcp_server, tmp_path):
+class TestRestoreProjectVersion:
+    def test_restore_project_round_trip(self, mcp_server, tmp_path):
+        """save -> modify sch+pcb+pro -> restore -> all files revert together."""
         port, sid = mcp_server
-        fp = _make_test_file(tmp_path, content="original content")
-        save_result = _call_tool(port, sid, "save_file_version", {"file_path": fp})
-        assert "error" not in save_result
-        version_id = save_result["version_id"]
+        pro = _make_project(tmp_path)
+        saved = _call_tool(port, sid, "save_project_version", {"project_file": pro})
+        version_id = saved["version_id"]
 
-        # Modify the file
-        with open(fp, "w") as f:
-            f.write("modified content")
+        pro_path = tmp_path / "board.kicad_pro"
+        pro_path.write_text(json.dumps({"meta": {"filename": "board.kicad_pro", "version": 2}}))
+        (tmp_path / "board.kicad_sch").write_text('(kicad_sch (version 20240102) (paper "A"))\n')
+        (tmp_path / "board.kicad_pcb").write_text("pcb v2\n")
 
-        # Restore
-        result = _call_tool(
+        restored = _call_tool(
             port,
             sid,
-            "restore_file_version",
-            {
-                "file_path": fp,
-                "version_id": version_id,
-            },
+            "restore_project_version",
+            {"project_file": str(pro_path), "version_id": version_id},
         )
-        assert "error" not in result, result
-        assert result.get("success") is True
-
-        # Verify content is restored
-        with open(fp) as f:
-            assert f.read() == "original content"
-
-    def test_restore_creates_backup_of_current(self, mcp_server, tmp_path):
-        port, sid = mcp_server
-        fp = _make_test_file(tmp_path, content="v1")
-        save_result = _call_tool(port, sid, "save_file_version", {"file_path": fp})
-        version_id = save_result["version_id"]
-
-        with open(fp, "w") as f:
-            f.write("v2")
-
-        result = _call_tool(
-            port,
-            sid,
-            "restore_file_version",
-            {
-                "file_path": fp,
-                "version_id": version_id,
-            },
-        )
-        assert "error" not in result
-        backup = result.get("backup_of_current", "")
-        assert backup and os.path.isfile(backup), f"Backup not found at {backup!r}"
+        assert "error" not in restored, restored
+        assert restored.get("restored_from") == version_id
+        assert set(restored.get("files", [])) == {
+            "board.kicad_pro",
+            "board.kicad_sch",
+            "board.kicad_pcb",
+        }
+        assert (tmp_path / "board.kicad_sch").read_text() == '(kicad_sch (version 20240101) (paper "A"))\n'
+        assert (tmp_path / "board.kicad_pcb").read_text() == "pcb v1\n"
+        assert json.loads(pro_path.read_text())["meta"]["version"] == 1
 
     def test_restore_invalid_version_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
-        fp = _make_test_file(tmp_path)
+        pro = _make_project(tmp_path)
         result = _call_tool(
             port,
             sid,
-            "restore_file_version",
-            {
-                "file_path": fp,
-                "version_id": "nonexistent-version-id",
-            },
+            "restore_project_version",
+            {"project_file": pro, "version_id": "nonexistent-id"},
         )
         assert "error" in result
-
-    def test_restore_nonexistent_file_returns_error(self, mcp_server):
-        port, sid = mcp_server
-        result = _call_tool(
-            port,
-            sid,
-            "restore_file_version",
-            {
-                "file_path": "/nonexistent/path/test.kicad_sch",
-                "version_id": "some-id",
-            },
-        )
-        assert "error" in result
-
-    def test_save_list_restore_roundtrip(self, mcp_server, tmp_path):
-        """Full workflow: save → modify → list → restore → verify."""
-        port, sid = mcp_server
-        fp = _make_test_file(tmp_path, content="roundtrip v1")
-
-        # Save version
-        save = _call_tool(port, sid, "save_file_version", {"file_path": fp})
-        assert "error" not in save
-        vid = save["version_id"]
-
-        # Modify
-        with open(fp, "w") as f:
-            f.write("roundtrip v2")
-
-        # List versions
-        lst = _call_tool(port, sid, "list_file_versions", {"file_path": fp})
-        assert "error" not in lst
-        assert lst["count"] >= 1
-        assert any(v["id"] == vid for v in lst["versions"])
-
-        # Restore
-        restore = _call_tool(
-            port,
-            sid,
-            "restore_file_version",
-            {
-                "file_path": fp,
-                "version_id": vid,
-            },
-        )
-        assert "error" not in restore
-
-        # Verify
-        with open(fp) as f:
-            assert f.read() == "roundtrip v1"

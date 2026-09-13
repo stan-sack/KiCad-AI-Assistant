@@ -32,6 +32,8 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "extract_project_netlist": ToolPolicy(kind="query"),
     "extract_schematic_netlist": ToolPolicy(kind="query"),
     "find_component_connections": ToolPolicy(kind="query"),
+    # Project tools
+    "get_project_structure": ToolPolicy(kind="query", path_arg="project_path"),
     # Symbol tools
     "sync_symbol_index": ToolPolicy(kind="indexing"),
     "get_symbol_sync_status": ToolPolicy(kind="query"),
@@ -157,6 +159,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "list_footprint_libraries": ToolPolicy(kind="query"),
     "search_footprints": ToolPolicy(kind="query"),
     "get_footprint_details": ToolPolicy(kind="query"),
+    # PCB → library export tools
+    "find_footprints_not_in_libraries": ToolPolicy(kind="query"),
+    "create_footprint_library": ToolPolicy(kind="file_mutation"),
+    # Writes .kicad_mod files into the target library; the PCB itself is
+    # never modified, so no PCB snapshot/dirty tracking is attached.
+    "add_footprints_to_library": ToolPolicy(kind="file_mutation"),
     # PCB query tools
     "get_board_info": ToolPolicy(kind="query"),
     "list_footprints": ToolPolicy(kind="query"),
@@ -395,15 +403,15 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "update_pcb_from_schematic": ToolPolicy(kind="ipc_action"),
     "reload_kicad": ToolPolicy(kind="ui_refresh", clear_dirty_paths_arg="paths"),
     # Version tools
-    "save_file_version": ToolPolicy(
+    "save_project_version": ToolPolicy(
         kind="versioning",
-        path_arg="file_path",
+        path_arg="project_file",
         track_snapshot=True,
     ),
-    "list_file_versions": ToolPolicy(kind="versioning"),
-    "restore_file_version": ToolPolicy(
+    "list_project_versions": ToolPolicy(kind="versioning"),
+    "restore_project_version": ToolPolicy(
         kind="versioning",
-        path_arg="file_path",
+        path_arg="project_file",
         track_snapshot=True,
         mark_dirty=True,
     ),

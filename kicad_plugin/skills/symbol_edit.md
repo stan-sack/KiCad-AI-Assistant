@@ -14,12 +14,19 @@ description: "Property CRUD, reference renaming, label management, reference con
 - **check_reference_conflicts** — Find duplicate reference designators across the project hierarchy.
 
 # Recommended property workflow
-1. Call **list_symbol_properties(schematic_path, reference)** to see existing properties
-   (returns `{name, value}` pairs from the first unit of a multi-unit symbol).
-2. Call **set_symbol_property(schematic_path, reference, property_name, property_value)**
-   to add or update. All units sharing that reference are updated together. Non-standard
-   properties (anything besides Reference and Value) are hidden on the canvas by default.
-   Returns `action` ("added", "updated", or "mixed") to tell you what happened per-unit.
+1. Call **list_symbol_properties(schematic_path, references)** to see existing
+   properties for one or more components (returns `{name, value}` pairs from
+   the first unit of each multi-unit symbol).
+2. Call **set_symbol_property(schematic_path, items)** to add or update.
+   Each ``items`` entry is ``{"reference", "property_name", "property_value"}``
+   (e.g. ``[{"reference": "R1", "property_name": "Value", "property_value":
+   "22k"}, {"reference": "C1", "property_name": "MPN", "property_value":
+   "X7R"}]``); targets may carry different property/value pairs in one call,
+   and all units sharing a reference are updated together.  Non-standard
+   properties
+   (anything besides Reference and Value) are hidden on the canvas by default.
+   Each target returns `action` ("added", "updated", or "mixed") to tell you
+   what happened per-unit.
 3. To remove, call **delete_symbol_property(schematic_path, reference, property_name)**.
    `Reference` and `Value` are KiCad-required and **cannot be deleted**; attempting to do so
    returns an error without modifying the file.

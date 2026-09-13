@@ -252,6 +252,9 @@ kcaa
 | `list_footprint_libraries` | 列出所有可用封装库 |
 | `search_footprints` | 按名称/描述/标签搜索封装 |
 | `get_footprint_details` | 获取封装详情（焊盘、边界框等） |
+| `find_footprints_not_in_libraries` | 列出板上缺失于所有已索引库的封装 |
+| `create_footprint_library` | 创建全局 3rdparty 或项目级封装库 |
+| `add_footprints_to_library` | 将显式指定的板载封装导出到库 |
 
 ### PCB 查询
 
@@ -283,7 +286,7 @@ kcaa
 
 | 工具 | 说明 |
 |------|------|
-| `set_footprint_position` | 移动/旋转单个封装 |
+| `set_footprint_position` | 批量移动/旋转一个或多个封装 |
 | `flip_footprint` | 将封装在顶层/底层之间翻转 |
 | `align_footprints` | 将封装对齐到同一坐标轴 |
 | `distribute_footprints` | 沿坐标轴等间距分布封装 |
@@ -331,9 +334,9 @@ kcaa
 
 | 工具 | 说明 |
 |------|------|
-| `save_file_version` | 保存版本快照以便回退 |
-| `list_file_versions` | 列出已保存的版本快照 |
-| `restore_file_version` | 恢复到之前保存的版本 |
+| `save_project_version` | 保存项目版本归档（原理图+PCB+项目文件） |
+| `list_project_versions` | 列出已保存的项目版本归档 |
+| `restore_project_version` | 将项目文件一起恢复到已保存的归档 |
 | `generate_pcb_thumbnail` | 渲染 PCB 缩略图 |
 | `generate_project_thumbnail` | 渲染项目缩略图 |
 

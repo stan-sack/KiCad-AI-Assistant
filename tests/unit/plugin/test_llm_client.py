@@ -18,6 +18,16 @@ from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
 
+def _on_event_collect(chunks):
+    """Build an on_stream_event callback that records text chunks in order."""
+
+    def _on_stream_event(evt):
+        if evt.get("type") == "text_chunk":
+            chunks.append(evt["content"])
+
+    return _on_stream_event
+
+
 class _SSETestServer(ThreadingHTTPServer):
     """Threaded localhost server that answers POST with an SSE body."""
 
@@ -481,7 +491,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -507,19 +520,25 @@ class TestRunIntegration:
         assert result == "done"
         assert mock_call_tool.call_args_list == [
             ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
             (
                 (
                     client._mcp_base_url,
                     "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0},
+                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
                 ),
             ),
             ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
             "save_document",
-            "save_file_version",
+            "save_project_version",
             "set_footprint_position",
             "reload_kicad",
         ]
@@ -565,7 +584,13 @@ class TestRunIntegration:
         assert result == "done"
         assert mock_call_tool.call_args_list == [
             ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
             (
                 (
                     client._mcp_base_url,
@@ -577,7 +602,7 @@ class TestRunIntegration:
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
             "save_document",
-            "save_file_version",
+            "save_project_version",
             "pcb_route_pad_to_pad",
             "reload_kicad",
         ]
@@ -597,7 +622,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -638,7 +666,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -679,7 +710,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     },
@@ -732,7 +766,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     },
@@ -771,12 +808,18 @@ class TestRunIntegration:
         assert result == "done"
         assert mock_call_tool.call_args_list == [
             ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
             (
                 (
                     client._mcp_base_url,
                     "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0},
+                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
                 ),
             ),
             (
@@ -789,7 +832,7 @@ class TestRunIntegration:
             ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
         ]
 
-    def test_explicit_save_file_version_is_reused_by_later_mutation(self):
+    def test_explicit_save_project_version_is_reused_by_later_mutation(self):
         client = _make_client()
         save_response = {
             "finish_reason": "tool_calls",
@@ -800,8 +843,8 @@ class TestRunIntegration:
                         "id": "tc1",
                         "type": "function",
                         "function": {
-                            "name": "save_file_version",
-                            "arguments": json.dumps({"file_path": "/tmp/board.kicad_pcb"}),
+                            "name": "save_project_version",
+                            "arguments": json.dumps({"project_file": "/tmp/board.kicad_pro"}),
                         },
                     }
                 ],
@@ -818,7 +861,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -829,7 +875,7 @@ class TestRunIntegration:
         client._call_llm = MagicMock(side_effect=[save_response, mutate_response, final_response])
         client._fetch_tool_definitions = MagicMock(
             return_value=[
-                {"function": {"name": "save_file_version"}},
+                {"function": {"name": "save_project_version"}},
                 {"function": {"name": "set_footprint_position"}},
             ]
         )
@@ -844,12 +890,18 @@ class TestRunIntegration:
 
         assert result == "done"
         assert mock_call_tool.call_args_list == [
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
             (
                 (
                     client._mcp_base_url,
                     "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0},
+                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
                 ),
             ),
             ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
@@ -868,7 +920,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -888,11 +943,19 @@ class TestRunIntegration:
         assert result == "done"
         assert mock_call_tool.call_args_list == [
             ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
         ]
         tool_result = json.loads(client._history[-2]["content"])
         assert tool_result["success"] is False
-        assert "Failed to save file version before set_footprint_position" in tool_result["error"]
+        assert (
+            "Failed to save project version before set_footprint_position" in tool_result["error"]
+        )
 
     def test_run_reports_missing_tool_policy_before_calling_llm(self):
         client = _make_client()
@@ -1125,7 +1188,7 @@ class TestStreaming:
         ]
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp) as m:
-            client._stream_anthropic("sys", [], on_text_delta=lambda c: None)
+            client._stream_anthropic("sys", [], on_stream_event=lambda evt: None)
 
         payload = json.loads(m.call_args[0][0].data)
         assert payload["max_tokens"] == llm_client._ANTHROPIC_DEFAULT_MAX_TOKENS
@@ -1141,11 +1204,34 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == ["Hello", " world"]
         assert result["message"]["content"] == "Hello world"
         assert result["finish_reason"] == "stop"
+
+    def test_stream_openai_emits_text_boundary_events(self):
+        """text_start precedes the chunks and text_end follows the last one —
+        the ordering guarantee the panel consumer relies on (Bug B)."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        events = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=events.append)
+
+        assert result["message"]["content"] == "Hello world"
+        assert [e["type"] for e in events] == [
+            "text_start",
+            "text_chunk",
+            "text_chunk",
+            "text_end",
+        ]
+        assert events[-1]["type"] == "text_end"
 
     def test_stream_openai_skips_empty_choices_chunk(self):
         """Mid-stream empty choices chunks (usage/keepalive) must not abort
@@ -1161,7 +1247,7 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == ["Checking"]
         tc = result["message"]["tool_calls"]
@@ -1193,7 +1279,7 @@ class TestStreaming:
             patch.object(llm_client, "_in_process_ssl", None),
             patch("urllib.request.urlopen", side_effect=err),
         ):
-            result = client._stream_openai("sys", [], on_text_delta=lambda c: None)
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
 
         assert result["error"] == (
             'HTTP 400: {"code":"InvalidParameter","message":"Request body format invalid"}'
@@ -1211,7 +1297,7 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == []
         tc = result["message"]["tool_calls"]
@@ -1235,7 +1321,7 @@ class TestStreaming:
             patch.object(llm_client, "_in_process_ssl", None),
             patch("urllib.request.urlopen", side_effect=err),
         ):
-            result = client._stream_anthropic("sys", [], on_text_delta=lambda c: None)
+            result = client._stream_anthropic("sys", [], on_stream_event=lambda evt: None)
 
         assert result["error"] == (
             'HTTP 400: {"code":"InvalidParameter","message":"Request body format invalid"}'
@@ -1264,7 +1350,7 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+            result = client._stream_anthropic("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == ["Hello", " AI"]
         assert result["message"]["content"] == "Hello AI"
@@ -1289,7 +1375,7 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+            result = client._stream_anthropic("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == []
         tc = result["message"]["tool_calls"]
@@ -1328,7 +1414,7 @@ class TestStreaming:
                 return_value=subprocess_result,
             ) as mock_stream,
         ):
-            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
 
         mock_stream.assert_called_once()
         call_kwargs = mock_stream.call_args.kwargs
@@ -1365,7 +1451,7 @@ class TestStreaming:
                 return_value=subprocess_result,
             ) as mock_stream,
         ):
-            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+            result = client._stream_anthropic("sys", [], on_stream_event=_on_event_collect(chunks))
 
         mock_stream.assert_called_once()
         call_kwargs = mock_stream.call_args.kwargs
@@ -1373,22 +1459,48 @@ class TestStreaming:
         assert call_kwargs["timeout"] == 300
         assert result["message"]["tool_calls"] == [{"id": "tu1"}]
 
-    def test_run_passes_on_text_delta_to_call_llm(self):
+    def test_stream_anthropic_emits_text_boundary_events(self):
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        sse_lines = [
+            "event: content_block_start",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}',
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" AI"}}',
+            "event: message_delta",
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        ]
+        events = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_anthropic("sys", [], on_stream_event=events.append)
+
+        assert result["message"]["content"] == "Hello AI"
+        assert [e["type"] for e in events] == [
+            "text_start",
+            "text_chunk",
+            "text_chunk",
+            "text_end",
+        ]
+
+    def test_run_passes_on_stream_event_to_call_llm(self):
         client = _make_client()
         final_response = {
             "finish_reason": "stop",
             "message": {"content": "done", "tool_calls": []},
         }
-        on_delta = MagicMock()
+        on_event = MagicMock()
         client._call_llm = MagicMock(return_value=final_response)
         client._fetch_tool_definitions = MagicMock(return_value=[])
 
-        result = client.run("hello", context_block="", on_text_delta=on_delta)
+        result = client.run("hello", context_block="", on_stream_event=on_event)
 
         assert result == "done"
-        # _call_llm must have been called with on_text_delta=on_delta
+        # _call_llm must have been called with on_stream_event=on_event
         call_kwargs = client._call_llm.call_args
-        assert call_kwargs.kwargs.get("on_text_delta") is on_delta
+        assert call_kwargs.kwargs.get("on_stream_event") is on_event
 
 
 class TestSubprocessSSEStream:
@@ -1417,7 +1529,7 @@ class TestSubprocessSSEStream:
                     payload=b'{"model":"t","stream":true}',
                     timeout=30,
                     fmt=fmt,
-                    on_text_delta=chunks.append,
+                    on_stream_event=_on_event_collect(chunks),
                 )
         finally:
             server.shutdown()
@@ -1505,8 +1617,10 @@ class TestSubprocessSSEStream:
         server = _SSETestServer(lines)
         seen = []
 
-        def boom(chunk):
-            seen.append(chunk)
+        def boom(evt):
+            content = evt.get("content")
+            if content:
+                seen.append(content)
             raise ValueError("ui hiccup")
 
         try:
@@ -1526,7 +1640,7 @@ class TestSubprocessSSEStream:
                     payload=b"{}",
                     timeout=30,
                     fmt="openai",
-                    on_text_delta=boom,
+                    on_stream_event=boom,
                 )
         finally:
             server.shutdown()
@@ -1569,7 +1683,7 @@ class TestPruneRollbackHistory:
           ("user", "text or dict")
           ("assistant", text)
           ("assistant+tc", [tool_call, ...])
-          ("tool+save", file_path, version_id, tool_call_id)  → save_file_version result
+          ("tool+save", file_path, version_id, tool_call_id)  → save_project_version result
           ("tool+restore", file_path, version_id, tool_call_id) → restore result
           ("tool+misc", tool_call_id, content_dict) → generic tool result
           ("tool", tool_call_id, "content_string")
@@ -1629,8 +1743,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "tc1",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v999"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v999"},
                         )
                     ],
                 ),
@@ -1648,7 +1762,10 @@ class TestPruneRollbackHistory:
         history = self._make_history(
             [
                 ("user", "add resistor"),
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v1", "s1"),
                 # Turn A – touches file
                 (
@@ -1665,8 +1782,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -1686,7 +1803,10 @@ class TestPruneRollbackHistory:
         history = self._make_history(
             [
                 ("user", "start"),
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v1", "s1"),
                 # Turn touches f.sch
                 (
@@ -1706,8 +1826,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -1738,7 +1858,10 @@ class TestPruneRollbackHistory:
         history = self._make_history(
             [
                 ("user", "start"),
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v1", "s1"),
                 # One turn with two tool_calls: only one touches f.sch
                 (
@@ -1757,8 +1880,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
                         ),
                     ],
                 ),
@@ -1785,7 +1908,10 @@ class TestPruneRollbackHistory:
             [
                 ("user", "start"),
                 # save v1
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v1", "s1"),
                 # Turn T1
                 (
@@ -1794,7 +1920,10 @@ class TestPruneRollbackHistory:
                 ),
                 ("tool", "t1", '{"uuid": "T1"}'),
                 # save v2 (after T1)
-                ("assistant+tc", [_tool_call("s2", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s2", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v2", "s2"),
                 # Turn T2
                 (
@@ -1808,8 +1937,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst2",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v2"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v2"},
                         )
                     ],
                 ),
@@ -1826,8 +1955,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst1",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -1845,7 +1974,7 @@ class TestPruneRollbackHistory:
                 assert "version_id" in content or "restored_from" in content
             if m["role"] == "assistant" and m.get("tool_calls"):
                 names = [tc["function"]["name"] for tc in m["tool_calls"]]
-                assert all(n in ("save_file_version", "restore_file_version") for n in names)
+                assert all(n in ("save_project_version", "restore_project_version") for n in names)
 
     # ---- Multiple file paths -------------------------------------------------
 
@@ -1853,9 +1982,15 @@ class TestPruneRollbackHistory:
         history = self._make_history(
             [
                 ("user", "start"),
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "a.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "a.kicad_pro"})],
+                ),
                 ("tool+save", "a.sch", "vA", "s1"),
-                ("assistant+tc", [_tool_call("s2", "save_file_version", {"file_path": "b.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s2", "save_project_version", {"project_file": "b.kicad_pro"})],
+                ),
                 ("tool+save", "b.sch", "vB", "s2"),
                 (
                     "assistant+tc",
@@ -1872,8 +2007,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "a.sch", "version_id": "vA"},
+                            "restore_project_version",
+                            {"project_file": "a.kicad_pro", "version_id": "vA"},
                         )
                     ],
                 ),
@@ -1891,14 +2026,22 @@ class TestPruneRollbackHistory:
                     if tc["function"]["name"] == "add_symbol_to_schematic":
                         assert args["file_path"] == "b.sch"
 
-    def test_restore_schematic_does_not_affect_pcb(self):
-        """Restoring a .sch file must not prune .kicad_pcb modifications."""
+    def test_restore_project_prunes_all_project_files(self):
+        """Restoring a project prunes turns touching ANY bundled file (sch or PCB).
+
+        The archive bundles the same-stem schematic + PCB + project file, so
+        a project restore invalidates tool calls against either file.
+        """
         history = self._make_history(
             [
                 ("user", "start"),
                 (
                     "assistant+tc",
-                    [_tool_call("s1", "save_file_version", {"file_path": "proj/main.kicad_sch"})],
+                    [
+                        _tool_call(
+                            "s1", "save_project_version", {"project_file": "proj/main.kicad_pro"}
+                        )
+                    ],
                 ),
                 ("tool+save", "proj/main.kicad_sch", "v1", "s1"),
                 # Schematic change
@@ -1923,8 +2066,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "proj/main.kicad_sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "proj/main.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -1934,22 +2077,12 @@ class TestPruneRollbackHistory:
         client = _make_client()
         client._history = history
         client._prune_rollback_history()
-        # Schematic turn should be pruned
+        # Both the schematic and the PCB turns should be pruned
         for m in client._history:
             if m["role"] == "assistant" and m.get("tool_calls"):
                 names = [tc["function"]["name"] for tc in m["tool_calls"]]
                 assert "add_symbol_to_schematic" not in names
-        # PCB turn MUST survive
-        pcb_assistants = [
-            m
-            for m in client._history
-            if m["role"] == "assistant"
-            and m.get("tool_calls")
-            and any(tc["function"]["name"] == "add_footprint" for tc in m["tool_calls"])
-        ]
-        assert len(pcb_assistants) == 1
-        args = json.loads(pcb_assistants[0]["tool_calls"][0]["function"]["arguments"])
-        assert args["file_path"] == "proj/main.kicad_pcb"
+                assert "add_footprint" not in names
 
     def test_restore_shares_only_same_full_path(self):
         """Files with same stem but different paths are treated independently."""
@@ -1958,7 +2091,13 @@ class TestPruneRollbackHistory:
                 ("user", "start"),
                 (
                     "assistant+tc",
-                    [_tool_call("s1", "save_file_version", {"file_path": "proj/sub/leaf.sch"})],
+                    [
+                        _tool_call(
+                            "s1",
+                            "save_project_version",
+                            {"project_file": "proj/sub/leaf.kicad_pro"},
+                        )
+                    ],
                 ),
                 ("tool+save", "proj/sub/leaf.sch", "v1", "s1"),
                 # Change to leaf.sch in a different directory
@@ -1973,8 +2112,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "proj/sub/leaf.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "proj/sub/leaf.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -2165,3 +2304,114 @@ class TestAnnotateStaleQueries:
         client._annotate_stale_queries()
         tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"][0]
         assert not tc1_result["content"].startswith(_STALE_MARKER)
+
+
+class TestToolDirectRequest:
+    """Framework tool_direct requests route through run() but never reach the
+    LLM: executed directly, assistant+tool pair recorded in history, request
+    itself not stored."""
+
+    REQUEST = {
+        "kind": "tool_direct",
+        "name": "sync_footprint_index",
+        "arguments": {"project_path": "/p"},
+    }
+
+    def test_direct_executes_tool_and_records_pair(self):
+        client = _make_client()
+        calls = []
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}
+        ) as mock_call:
+            result = client.run(
+                self.REQUEST,
+                "",
+                on_tool_call=lambda name, args, res: calls.append((name, args, res)),
+            )
+        assert result == {"status": "started"}
+        mock_call.assert_called_once()
+        # UI callback fired with the tool name / args / result
+        assert calls == [("sync_footprint_index", {"project_path": "/p"}, {"status": "started"})]
+        # History: synthetic user preamble + assistant/tool pair — no stale
+        # user residue for the request itself beyond the preamble.
+        assert len(client._history) == 3
+        assert client._history[0]["role"] == "user"
+        assistant, tool = client._history[1], client._history[2]
+        assert assistant["role"] == "assistant"
+        assert assistant["tool_calls"][0]["function"]["name"] == "sync_footprint_index"
+        assert assistant["tool_calls"][0]["function"]["arguments"] == '{"project_path": "/p"}'
+        assert tool["role"] == "tool"
+        assert tool["tool_call_id"] == assistant["tool_calls"][0]["id"]
+        assert tool["content"] == '{"status": "started"}'
+
+    def test_direct_appends_to_existing_user_history_without_preamble(self):
+        client = _make_client()
+        client._history.append({"role": "user", "content": "hi"})
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.run(self.REQUEST, "")
+        roles = [m["role"] for m in client._history]
+        # No extra preamble: existing user message already opens the history
+        assert roles == ["user", "assistant", "tool"]
+
+    def test_direct_survives_validate_history(self):
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.run(self.REQUEST, "")
+        client._validate_history()
+        assert len(client._history) == 3
+
+    def test_direct_persisted_via_get_history(self):
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.run(self.REQUEST, "")
+        snapshot = client.get_history()
+        assert len(snapshot) == 3
+        assert snapshot[0]["role"] == "user"
+        assert snapshot[1]["role"] == "assistant"
+        assert snapshot[2]["role"] == "tool"
+
+    def test_direct_failure_records_error_pair_and_fires_callback(self):
+        client = _make_client()
+        calls = []
+
+        def _boom(base_url, tool_name, args):
+            raise RuntimeError("backend down")
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_boom):
+            result = client.run(
+                self.REQUEST,
+                "",
+                on_tool_call=lambda name, args, res: calls.append((name, args, res)),
+            )
+        # Exception captured as a failed result — no propagation
+        assert result["success"] is False
+        assert "backend down" in result["error"]
+        assert calls[0][2]["success"] is False
+        # History pair still complete so _validate_history does not strip it
+        assert len(client._history) == 3
+        client._validate_history()
+        assert len(client._history) == 3
+
+    def test_direct_anthropic_conversion_opens_with_user_and_alternates(self):
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.run(self.REQUEST, "")
+            # next chat request appends a real user message after the pair
+            client._history.append({"role": "user", "content": "thanks"})
+        messages = client._build_anthropic_messages()
+        assert messages[0]["role"] == "user"
+        assert [m["role"] for m in messages].count("user") == 2
+        assert [m["role"] for m in messages].count("assistant") == 1
+        # tool result + following user text merged into one user message
+        last = messages[-1]
+        assert last["role"] == "user"
+        merged_text = "".join(b.get("text", "") for b in last["content"] if b.get("type") == "text")
+        assert "thanks" in merged_text
+
+    def test_direct_unknown_kind_still_treated_as_chat(self):
+        # A dict without kind == "tool_direct" is not a framework request;
+        # run() treats it as ordinary user text content rendering (dict str).
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            reply = client.run({"not": "a request"}, "")
+        assert isinstance(reply, str)

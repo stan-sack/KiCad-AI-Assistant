@@ -6,11 +6,12 @@ Two server profiles are supported, selected via the KICAD_MCP_PROFILE environmen
   full   (default) — registers all tools, resources, and prompts. Intended for
                      standalone MCP clients such as Claude Desktop.
 
-  plugin            — registers only the skip-based schematic editing tools
-                     (netlist, symbol, component, wire/junction). No resources,
-                     no prompts, no kicad-cli-dependent tools. Intended for the
-                     KiCad plugin integration where the plugin supplies project
-                     context directly and the LLM drives editing via tool calls.
+  plugin            — registers the skip-based schematic/PCB editing tools
+                     plus the ``get_project_structure`` query tool. No
+                     resources, no prompts, no kicad-cli-dependent tools.
+                     Intended for the KiCad plugin integration where the
+                     plugin supplies project context directly and the LLM
+                     drives editing via tool calls.
 """
 
 import atexit
@@ -39,9 +40,12 @@ from kcaa.tools.pcb_placement_tools import register_pcb_placement_tools
 from kcaa.tools.pcb_query_tools import register_pcb_query_tools
 from kcaa.tools.pcb_routing_tools import register_pcb_routing_tools
 from kcaa.tools.pcb_zone_tools import register_pcb_zone_tools
+from kcaa.tools.image_tools import register_image_tools
 from kcaa.tools.placement_helpers import register_placement_helpers
+from kcaa.tools.project_tools import register_project_tools
 from kcaa.tools.schematic_group_tools import register_schematic_group_tools
 from kcaa.tools.sheet_tools import register_sheet_tools
+from kcaa.tools.snippet_tools import register_snippet_tools
 from kcaa.tools.skill_tools import register_skill_tools
 from kcaa.tools.symbol_edit_tools import register_symbol_edit_tools
 from kcaa.tools.symbol_tools import register_symbol_tools
@@ -110,12 +114,17 @@ def register_signal_handlers(server: FastMCP) -> None:
 
 
 def _register_plugin_profile(mcp: FastMCP) -> None:
-    """Register only the skip-based schematic/PCB editing tools + IPC-based tools for the plugin profile."""
+    """Register the skip-based schematic/PCB editing tools + IPC-based tools for the plugin profile."""
     logging.info("Registering plugin profile: schematic + PCB tools")
     register_netlist_tools(mcp)
+    # Project structure query for the plugin LLM; keep full-profile
+    # management tools (list_projects/open_project) out of this profile.
+    register_project_tools(mcp, tools=("get_project_structure",))
     register_symbol_tools(mcp)
     register_symbol_edit_tools(mcp)
     register_sheet_tools(mcp)
+    register_snippet_tools(mcp)
+    register_image_tools(mcp)
     register_wire_edit_tools(mcp)
     register_pcb_library_tools(mcp)
     register_pcb_query_tools(mcp)
@@ -170,6 +179,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_project_tools(mcp)
     register_analysis_tools(mcp)
     register_export_tools(mcp)
+    register_image_tools(mcp)
     register_drc_tools(mcp)
     register_bom_tools(mcp)
     register_netlist_tools(mcp)
@@ -205,8 +215,9 @@ def create_server(profile: ServerProfile = "full") -> FastMCP:
     Args:
         profile: Server capability profile.
             "full"   — all tools, resources, and prompts (default; for Claude Desktop etc.)
-            "plugin" — plugin-facing profile: 26 skip-based schematic editing tools only,
-                       no resources, no prompts, no kicad-cli-dependent tools.
+            "plugin" — plugin-facing profile: skip-based schematic/PCB editing
+                       tools plus the get_project_structure query tool; no
+                       resources, no prompts, no kicad-cli-dependent tools.
                        Override via KICAD_MCP_PROFILE env var.
     """
     # Allow env var to override the profile argument; strip whitespace/case variants

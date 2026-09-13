@@ -237,21 +237,25 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 ---
 
-#### `set_symbol_property(schematic_path, reference, property_name, property_value)`
+#### `set_symbol_property(schematic_path, items)`
 
-**Purpose:** Sets or creates a named property on a placed component (e.g. `"Footprint"`, `"Value"`, `"MPN"`).
+**Purpose:** Sets or creates a named property on one or more placed components (e.g. `"Footprint"`, `"Value"`, `"MPN"`). Each `items` entry is `{"reference", "property_name", "property_value"}`. All entries are processed in one parse and one save (single `.bak`). Partial-apply: an entry that errors (e.g. unknown designator) keeps a per-reference error while the remaining properties are still written. Duplicate, empty, or unknown-field entries in `items` are rejected up front.
 
-**Key parameters:** All `str`. `property_name` is case-sensitive and must match the KiCad field name exactly.
+**Key parameters:**
+- `items` (`list[dict]`) — one or more self-contained entries, e.g. `[{"reference": "R1", "property_name": "Value", "property_value": "22k"}, {"reference": "R2", "property_name": "MPN", "property_value": "RC0402FR-0710KL"}]`. `property_name` is case-sensitive and must match the KiCad field name exactly; each target may carry its own property/value.
 
-**Success response:** `{"success": true, "reference": "U1", "property": "Footprint", "value": "..."}`
+**Success response:** `{"success": true, "results": [{"success": true, "reference": "R1", "action": "updated", "units_where_updated": 1, "units_where_added": 0}], "count": 1, "applied_count": 1, "failure_count": 0, "file_modified": "...", "backup_path": "..."}`
 
 ---
 
-#### `list_symbol_properties(schematic_path, reference)`
+#### `list_symbol_properties(schematic_path, references)`
 
-**Purpose:** Returns all properties and their values for one component. Use before `set_symbol_property` to discover existing field names.
+**Purpose:** Returns all properties and their values for one or more components. Use before `set_symbol_property` to discover existing field names.
 
-**Success response:** `{"success": true, "reference": "U1", "properties": {"Reference": "U1", "Value": "ATmega328P", ...}}`
+**Key parameters:**
+- `references` (`list[str]`) — one or more component designators, e.g. `["R1", "C2"]`. Must be non-empty and unique.
+
+**Success response:** `{"success": true, "results": [{"success": true, "reference": "R1", "properties": [{"name": "Reference", "value": "R1"}, {"name": "Value", "value": "10k"}]}], "count": 1, "failure_count": 0}`
 
 ---
 

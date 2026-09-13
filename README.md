@@ -253,6 +253,9 @@ kcaa
 | `list_footprint_libraries` | List all available footprint libraries |
 | `search_footprints` | Search footprints by name, description, or tag |
 | `get_footprint_details` | Get footprint details (pads, bounding box, etc.) |
+| `find_footprints_not_in_libraries` | List board footprints missing from every indexed library |
+| `create_footprint_library` | Create a global 3rdparty or project-local footprint library |
+| `add_footprints_to_library` | Export explicitly named board footprints into a library |
 
 ### PCB Query
 
@@ -284,7 +287,7 @@ kcaa
 
 | Tool | Description |
 |------|-------------|
-| `set_footprint_position` | Move and/or rotate a single footprint |
+| `set_footprint_position` | Move and/or rotate one or more footprints (via `items`) |
 | `flip_footprint` | Flip a footprint between top and bottom layer |
 | `align_footprints` | Align footprints to the same axis |
 | `distribute_footprints` | Distribute footprints evenly along an axis |
@@ -332,9 +335,9 @@ kcaa
 
 | Tool | Description |
 |------|-------------|
-| `save_file_version` | Save a version snapshot for rollback |
-| `list_file_versions` | List saved version snapshots |
-| `restore_file_version` | Restore to a previously saved version |
+| `save_project_version` | Save a project version archive (schematic+PCB+project file) |
+| `list_project_versions` | List saved project version archives |
+| `restore_project_version` | Restore project files together to a saved archive |
 | `generate_pcb_thumbnail` | Render a PCB thumbnail image |
 | `generate_project_thumbnail` | Render a project thumbnail |
 
@@ -398,6 +401,9 @@ kcaa/
 **MCP server fails to start:**
 - Linux: Check the plugin log in `~/.config/kicad/` for Python tracebacks.
 - Windows: Check the plugin log in `%APPDATA%/kicad/` for Python tracebacks.
+
+**Schematic corruption / "unclosed parens" errors:**
+- Disable KiCad's **Automatic save** and **Local file history** (Preferences → Miscellaneous). These can race with the MCP's file writes and silently truncate schematics. See [Troubleshooting — Preventing Schematic Corruption](docs/troubleshooting.md#preventing-schematic-corruption) for details.
 
 **Schematic editor does not refresh after edits:**
 - This is a current KiCad IPC limitation. Use **File → Reload** or press **Ctrl+Z / Ctrl+Y** to trigger a refresh in the schematic editor.

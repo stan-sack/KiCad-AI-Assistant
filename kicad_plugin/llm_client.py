@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import random
+import secrets
 import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 import time
 from typing import Any
@@ -23,6 +24,32 @@ from typing import Any
 from .tool_registry import get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
+
+
+def _project_path_for(file_path: str) -> str:
+    """Return the .kicad_pro path of the project containing *file_path*.
+
+    Accepts a schematic, PCB or project file; the project path shares the
+    directory and the stem up to the ``.kicad_*`` suffix.
+    """
+    d = os.path.dirname(os.path.abspath(file_path))
+    name = os.path.basename(file_path)
+    for suffix in (".kicad_pro", ".kicad_sch", ".kicad_pcb"):
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            break
+    else:
+        stem = os.path.splitext(name)[0]
+    return os.path.join(d, f"{stem}.kicad_pro")
+
+
+# Synthetic user message prepended to history when a framework tool_direct
+# turn (e.g. auto footprint sync) would otherwise open the conversation with
+# an assistant tool-call message — providers require the first message to
+# have role "user".
+FRAMEWORK_PREAMBLE = (
+    "(A framework-initiated tool call ran before this conversation: see the tool result below.)"
+)
 
 # ------------------------------------------------------------------
 # P1  stale-query detection: category mappings
@@ -350,7 +377,7 @@ def _subprocess_env() -> dict[str, str]:
 # Used when in-process SSL is unavailable so streaming still works with the
 # same per-read socket timeout as the in-process path.
 # Protocol (one JSON payload per line, whitespace-separated kind prefix):
-#   SSE-DATA  {"content": "..."}  text delta -> on_text_delta
+#   SSE-DATA  {"content": "..."}  text delta -> on_stream_event
 #   SSE-DONE  {"finish_reason": ..., "message": {...}}
 #   SSE-ERROR {"kind": "exception", "error": "..."} |
 #             {"status": <http_code>, "body": "..."} |
@@ -595,7 +622,7 @@ def _subprocess_sse_stream(
     payload: bytes,
     timeout: float,
     fmt: str,
-    on_text_delta: Callable[[str], None] | None,
+    on_stream_event: Callable[[dict], None] | None,
 ) -> dict[str, Any]:
     """Stream an HTTP SSE response through the plugin-venv Python subprocess.
 
@@ -643,6 +670,12 @@ def _subprocess_sse_stream(
         proc.kill()
         return {"error": f"HTTPS request failed: {e}"}
 
+    if on_stream_event is not None:
+        try:
+            on_stream_event({"type": "text_start"})
+        except Exception as e:  # noqa: BLE001 -- UI callback errors must not kill the turn
+            log.error("Subprocess stream event callback error: %s", e)
+
     done: dict[str, Any] | None = None
     error_result: dict[str, Any] | None = None
     for raw in proc.stdout:
@@ -653,11 +686,11 @@ def _subprocess_sse_stream(
                 content = json.loads(body).get("content") or ""
             except json.JSONDecodeError:
                 continue
-            if content and on_text_delta is not None:
+            if content and on_stream_event is not None:
                 try:
-                    on_text_delta(content)
+                    on_stream_event({"type": "text_chunk", "content": content})
                 except Exception as e:  # noqa: BLE001 -- UI callback errors must not kill the turn
-                    log.debug("Subprocess text delta callback error: %s", e)
+                    log.error("Subprocess text delta callback error: %s", e)
         elif kind == "SSE-DONE" and body:
             try:
                 done = json.loads(body)
@@ -702,6 +735,12 @@ def _subprocess_sse_stream(
         message["tool_calls"] = done_message["tool_calls"]
     if done_message.get("reasoning_content"):
         message["reasoning_content"] = done_message["reasoning_content"]
+    if on_stream_event is not None:
+        try:
+            on_stream_event({"type": "text_end"})
+        except Exception as e:  # noqa: BLE001 -- UI callback errors must not kill the turn
+            log.error("Subprocess stream event callback error: %s", e)
+
     return {"finish_reason": done.get("finish_reason", "stop"), "message": message}
 
 
@@ -716,7 +755,7 @@ You are a KiCad assistant — modest, cautious, and proactive.
   for guidance. The user is more experienced at solving circuit design
   problems — defer to their judgment.
 - Edit schematics/PCBs via MCP tools.
-- Unless asked, never call `save_file_version`, `reload_kicad`,
+- Unless asked, never call `save_project_version`, `reload_kicad`,
   `check_kicad_ipc_connection`, or `save_document`.
 - The framework handles snapshots/reloads. Use ``list_skills()`` /
   ``get_skill(name)`` for guides.\
@@ -937,6 +976,75 @@ class LLMClient:
         """Replace conversation history when restoring a saved session."""
         self._history = list(history)
 
+    def _run_tool_direct(
+        self,
+        request: dict[str, Any],
+        on_tool_call: Callable[[str, dict, Any], None] | None = None,
+    ) -> Any:
+        """Execute a framework tool_direct request (e.g. auto footprint sync).
+
+        The request itself is not a chat message: it is never sent to the
+        LLM and no user text is fabricated for it.  Only the tool call pair
+        — an assistant message declaring the call and the role="tool"
+        result — is appended to history, shaped exactly like ``run()``
+        output, so ``_validate_history`` accepts it, the next request
+        exposes it to the LLM, and the session's ``llm_history`` persists
+        it across reloads.
+
+        If history is empty, a synthetic user message is prepended first:
+        providers (Anthropic) require the first message to have role
+        "user".  With non-empty history the first message is already a
+        user message (every chat turn and every restored session opens
+        with one), so no preamble is needed.
+
+        An execution exception is captured and recorded as a failed result
+        instead of propagating: the history pair stays complete and the UI
+        callback still fires with the error.
+        """
+        tool_name = request.get("name") or ""
+        args = request.get("arguments") or {}
+        if not tool_name:
+            log.error("tool_direct: missing tool name")
+            return {"success": False, "error": "tool_direct request missing 'name'"}
+        call_id = f"fw-{tool_name}-{secrets.token_hex(4)}"
+
+        # Providers require the first message to have role "user".  This
+        # only ever fires for an empty history: a framework call is the
+        # first thing in a fresh session.  Once any chat turn or session
+        # restore exists, history already opens with a user message.
+        if not self._history:
+            self._history.insert(
+                0,
+                {
+                    "role": "user",
+                    "content": FRAMEWORK_PREAMBLE,
+                },
+            )
+
+        self._history.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": json.dumps(args)},
+                    }
+                ],
+            }
+        )
+        state = _ToolExecutionState()
+        try:
+            result = self._execute_tool_with_policy(tool_name, args, state, on_tool_call)
+        except Exception as exc:
+            log.error("Direct tool %s failed: %s", tool_name, exc, exc_info=True)
+            result = {"success": False, "error": str(exc)}
+            self._emit_tool_callback(on_tool_call, tool_name, args, result)
+        self._history.append(
+            {"role": "tool", "tool_call_id": call_id, "content": json.dumps(result)}
+        )
+        return result
+
     def _trim_history(self) -> None:
         """Drop oldest complete turns until history is within the cap.
 
@@ -1122,17 +1230,17 @@ class LLMClient:
         return True
 
     def _prune_rollback_history(self) -> None:
-        """Prune tool-call turns invalidated by restore_file_version.
+        """Prune tool-call turns invalidated by restore_project_version.
 
-        When the LLM restores a file to an earlier version, every tool call that
-        mutated or queried that file between the save point and the restore is
-        now based on stale state — prune those turns.
+        When the LLM restores a project to an earlier version, every tool
+        call that mutated or queried any of its files between the save point
+        and the restore is now based on stale state — prune those turns.
 
         Handles nested restores: starts from the most recent restore and skips
         any restore whose messages fall inside an already-pruned range.
         """
         # ---- Build save-point lookup ------------------------------------------
-        # For each save_file_version tool result, record (file_path, version_id) → index.
+        # For each save_project_version result, record (project_file, version_id) → index.
         save_points: dict[tuple[str, str], int] = {}
         for i, msg in enumerate(self._history):
             if msg.get("role") != "tool":
@@ -1145,19 +1253,19 @@ class LLMClient:
             for tc in parent.get("tool_calls") or []:
                 if tc.get("id") != tc_id:
                     continue
-                if tc.get("function", {}).get("name") != "save_file_version":
+                if tc.get("function", {}).get("name") != "save_project_version":
                     continue
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
                     result = json.loads(msg.get("content", "{}"))
-                    fp = args.get("file_path", "")
+                    fp = args.get("project_file", "")
                     vid = result.get("version_id", "")
                     if fp and vid:
                         save_points[(fp, vid)] = i
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
 
-        # ---- Scan from tail for restore_file_version -------------------------
+        # ---- Scan from tail for restore_project_version ----------------------
         marked: set[int] = set()  # indices to remove  (tool results)
         tool_call_removals: dict[int, list[str]] = {}  # assistant_idx → [tc_id, ...]
         i = len(self._history) - 1
@@ -1178,16 +1286,16 @@ class LLMClient:
             for tc in parent.get("tool_calls") or []:
                 if tc.get("id") != tc_id:
                     continue
-                if tc.get("function", {}).get("name") != "restore_file_version":
+                if tc.get("function", {}).get("name") != "restore_project_version":
                     continue
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
-                    file_path = args.get("file_path", "")
+                    project_file = args.get("project_file", "")
                     version_id = args.get("version_id", "")
                 except (json.JSONDecodeError, KeyError, TypeError):
                     break
 
-                save_idx = save_points.get((file_path, version_id))
+                save_idx = save_points.get((project_file, version_id))
                 if save_idx is None or save_idx >= i:
                     break  # Can't locate save point
 
@@ -1211,7 +1319,7 @@ class LLMClient:
                             tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
                         except (json.JSONDecodeError, KeyError, TypeError):
                             continue
-                        if self._tool_touches_file(tcj_args, file_path):
+                        if self._tool_touches_project(tcj_args, project_file):
                             marked.add(j)
                             tool_call_removals.setdefault(pj, []).append(tcj_id)
                 break
@@ -1332,10 +1440,12 @@ class LLMClient:
             log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
 
     @staticmethod
-    def _tool_touches_file(args: dict[str, Any], file_path: str) -> bool:
-        """Return True if *args* reference *file_path* via any known file arg name."""
+    def _tool_touches_project(args: dict[str, Any], project_file: str) -> bool:
+        """Return True if *args* reference any file of *project_file*'s project."""
+        target = os.path.abspath(project_file)
         for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
-            if args.get(key) == file_path:
+            value = args.get(key)
+            if value and os.path.abspath(_project_path_for(value)) == target:
                 return True
         return False
 
@@ -1432,7 +1542,7 @@ class LLMClient:
                 removed_count,
             )
 
-    def _maybe_compact(self, system_prompt: str) -> None:
+    def _maybe_compact(self, system_prompt: str, on_compacted=None) -> None:
         """Manage history purely by token budget.
 
         Under budget, history is left byte-identical (append-only growth), so
@@ -1485,8 +1595,12 @@ class LLMClient:
             200, int((target_post_compact - system_tokens - recent_tokens) * 4)
         )
 
-        self._compact_history(system_prompt, target_summary_chars)
+        compacted = self._compact_history(system_prompt, target_summary_chars)
         self._validate_history()  # compaction rebuilds history; verify integrity
+        if compacted and on_compacted is not None:
+            on_compacted(
+                "⟲ History compacted — earlier context summarised; recent turns kept verbatim."
+            )
 
         # Annotate stale query results among the preserved turns only — the
         # compacted prefix is summarized, so nothing earlier needs marking.
@@ -1545,7 +1659,7 @@ class LLMClient:
         try:
             on_tool_call(tool_name, args, result)
         except Exception as e:
-            log.debug("UI callback error in _emit_tool_callback: %s", e)  # must not break the loop
+            log.error("UI callback error in _emit_tool_callback: %s", e)  # must not break the loop
 
     def _execute_tool_with_policy(
         self,
@@ -1568,7 +1682,8 @@ class LLMClient:
                         f"{policy.path_arg!r} argument."
                     ),
                 }
-            if path not in state.snapshotted_paths:
+            project_path = _project_path_for(path)
+            if project_path not in state.snapshotted_paths:
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
                 save_args = {"file_path": path}
@@ -1581,20 +1696,20 @@ class LLMClient:
                         save_result.get("error", "unknown error"),
                     )
 
-                snapshot_args = {"file_path": path}
+                snapshot_args = {"project_file": project_path}
                 snapshot_result = call_mcp_tool(
-                    self._mcp_base_url, "save_file_version", snapshot_args
+                    self._mcp_base_url, "save_project_version", snapshot_args
                 )
                 self._emit_tool_callback(
-                    on_tool_call, "save_file_version", snapshot_args, snapshot_result
+                    on_tool_call, "save_project_version", snapshot_args, snapshot_result
                 )
                 if not self._tool_result_succeeded(snapshot_result):
                     error = snapshot_result.get("error", "unknown error")
                     return {
                         "success": False,
-                        "error": f"Failed to save file version before {tool_name}: {error}",
+                        "error": (f"Failed to save project version before {tool_name}: {error}"),
                     }
-                state.snapshotted_paths.add(path)
+                state.snapshotted_paths.add(project_path)
 
         result = call_mcp_tool(self._mcp_base_url, tool_name, args)
 
@@ -1615,7 +1730,7 @@ class LLMClient:
             return result
 
         if policy.track_snapshot and path:
-            state.snapshotted_paths.add(path)
+            state.snapshotted_paths.add(_project_path_for(path))
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):
@@ -1645,32 +1760,45 @@ class LLMClient:
 
     def run(
         self,
-        user_message: str,
+        user_message: str | dict[str, Any],
         context_block: str,
         on_tool_call: Callable[[str, dict, Any], None] | None = None,
-        on_text_delta: Callable[[str], None] | None = None,
+        on_stream_event: Callable[[dict], None] | None = None,
+        on_compacted: Callable[[str], None] | None = None,
         images: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
 
         Args:
-            user_message:  The engineer's chat message.
+            user_message:  The engineer's chat message, or a tool_direct
+                           request dict ({"kind": "tool_direct", "name": ...,
+                           "arguments": {...}}) for a framework-initiated
+                           tool call that skips the LLM entirely.
             context_block: Rendered KiCad context from context_bridge.
             on_tool_call:  Optional callback(tool_name, arguments, result) fired
                            after each tool execution — use this to update the UI.
-            on_text_delta: Optional callback(chunk) fired for each text chunk
-                           when streaming is active.
+            on_stream_event: Optional callback(evt) fired for each streaming
+                           lifecycle event: text_start / text_chunk / text_end.
+            on_compacted:  Optional callback(notice) fired when history
+                           compaction summarised part of the conversation —
+                           the UI surfaces this as a chat notice.
             images:        Optional list of dicts {"media_type": "image/png",
                            "data": "<base64>"} attached to this user message.
 
         Returns:
             The final assistant text message for display.
         """
+        # Framework tool_direct request (e.g. auto footprint sync): route
+        # through run() so it shares the turn lifecycle, but never send it
+        # to the LLM — execute the call directly and record the tool pair.
+        if isinstance(user_message, dict) and user_message.get("kind") == "tool_direct":
+            return self._run_tool_direct(user_message, on_tool_call)
+
         system = build_system_prompt(context_block)
         content = self._build_user_content(user_message, images)
         self._history.append({"role": "user", "content": content})
-        self._maybe_compact(system)
+        self._maybe_compact(system, on_compacted)
 
         tools = self._fetch_tool_definitions()
         missing_policies = get_missing_tool_policies(
@@ -1687,7 +1815,7 @@ class LLMClient:
 
         try:
             for _ in range(20):  # max 20 iterations (guard against infinite loops)
-                response = self._call_llm(system, tools, on_text_delta=on_text_delta)
+                response = self._call_llm(system, tools, on_stream_event=on_stream_event)
 
                 if response.get("error"):
                     reply = f"[LLM error] {response['error']}"
@@ -1819,7 +1947,7 @@ class LLMClient:
             for t in tools_raw
         ]
 
-    def _call_llm(self, system: str, tools: list[dict], on_text_delta=None) -> dict[str, Any]:
+    def _call_llm(self, system: str, tools: list[dict], on_stream_event=None) -> dict[str, Any]:
         """Dispatch to the configured LLM provider."""
         provider = self._settings.llm_provider
         tool_names = [t.get("function", {}).get("name", "?") for t in tools]
@@ -1839,15 +1967,15 @@ class LLMClient:
         max_retries = 5
         for attempt in range(max_retries):
             if provider == "ollama":
-                if on_text_delta is not None:
-                    response = self._stream_ollama(system, tools, on_text_delta)
+                if on_stream_event is not None:
+                    response = self._stream_ollama(system, tools, on_stream_event)
                 else:
                     response = self._call_ollama(system, tools)
-            elif on_text_delta is not None:
+            elif on_stream_event is not None:
                 if provider == "anthropic":
-                    response = self._stream_anthropic(system, tools, on_text_delta)
+                    response = self._stream_anthropic(system, tools, on_stream_event)
                 else:
-                    response = self._stream_openai(system, tools, on_text_delta)
+                    response = self._stream_openai(system, tools, on_stream_event)
             elif provider == "anthropic":
                 response = self._call_anthropic(system, tools)
             else:
@@ -1884,7 +2012,11 @@ class LLMClient:
             m = self._history[i]
             role = m.get("role")
             if role == "tool":
-                # Batch all consecutive tool results into one user message
+                # Batch all consecutive tool results into one user message.
+                # A plain user text that follows directly (e.g. the next chat
+                # message after a tool_direct pair) is folded into the same
+                # user message as a text block: Anthropic requires strictly
+                # alternating user/assistant roles.
                 tool_results = []
                 while i < len(self._history) and self._history[i].get("role") == "tool":
                     t = self._history[i]
@@ -1895,6 +2027,11 @@ class LLMClient:
                             "content": t.get("content"),
                         }
                     )
+                    i += 1
+                if i < len(self._history) and self._history[i].get("role") == "user":
+                    content = self._history[i].get("content") or ""
+                    if isinstance(content, str) and content.strip():
+                        tool_results.append({"type": "text", "text": content})
                     i += 1
                 messages.append({"role": "user", "content": tool_results})
                 continue
@@ -1948,14 +2085,14 @@ class LLMClient:
                     )
         return blocks
 
-    def _stream_openai(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+    def _stream_openai(self, system: str, tools: list[dict], on_stream_event) -> dict[str, Any]:
         """Call OpenAI-compatible API with streaming enabled.
 
         Uses in-process urllib for true SSE streaming when SSL is available;
         otherwise relays the SSE stream through the plugin-venv Python
         subprocess (_subprocess_sse_stream).  Both paths stream — there is no
         non-streaming fallback here; _call_openai is used only by callers
-        that do not provide on_text_delta (e.g. history compaction).
+        that do not provide on_stream_event (e.g. history compaction).
         """
         global _current_reasoning
         _current_reasoning = []
@@ -1988,6 +2125,8 @@ class LLMClient:
                 with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
                     _in_process_ssl = True
                     text_parts = []
+                    if on_stream_event is not None:
+                        on_stream_event({"type": "text_start"})
                     tool_calls_by_index: dict[int, dict] = {}
                     finish_reason = "stop"
 
@@ -2019,9 +2158,9 @@ class LLMClient:
                         if content:
                             text_parts.append(content)
                             try:
-                                on_text_delta(content)
+                                on_stream_event({"type": "text_chunk", "content": content})
                             except Exception as e:
-                                log.debug("Text delta callback error in streaming: %s", e)
+                                log.error("Text delta callback error in streaming: %s", e)
 
                         reasoning = delta.get("reasoning_content")
                         if reasoning:
@@ -2050,6 +2189,8 @@ class LLMClient:
                         message["tool_calls"] = tool_calls
                     if _current_reasoning:
                         message["reasoning_content"] = "".join(_current_reasoning)
+                    if on_stream_event is not None:
+                        on_stream_event({"type": "text_end"})
                     return {"finish_reason": finish_reason, "message": message}
 
             except urllib.error.HTTPError as e:
@@ -2064,7 +2205,7 @@ class LLMClient:
 
         # In-process SSL unavailable: stream via the plugin-venv Python subprocess.
         return _subprocess_sse_stream(
-            url, headers, payload, timeout=300, fmt="openai", on_text_delta=on_text_delta
+            url, headers, payload, timeout=300, fmt="openai", on_stream_event=on_stream_event
         )
 
     def _ollama_messages(self) -> list[dict[str, Any]]:
@@ -2097,7 +2238,7 @@ class LLMClient:
             out.append(converted)
         return out
 
-    def _stream_ollama(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+    def _stream_ollama(self, system: str, tools: list[dict], on_stream_event) -> dict[str, Any]:
         """Call Ollama native API with streaming enabled.
 
         Uses the Ollama /api/chat endpoint with ``stream: true``.
@@ -2127,6 +2268,8 @@ class LLMClient:
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- localhost only
                 text_parts = []
+                if on_stream_event is not None:
+                    on_stream_event({"type": "text_start"})
                 tool_calls_by_index: dict[int, dict] = {}
                 finish_reason = "stop"
 
@@ -2151,9 +2294,9 @@ class LLMClient:
                     if content:
                         text_parts.append(content)
                         try:
-                            on_text_delta(content)
+                            on_stream_event({"type": "text_chunk", "content": content})
                         except Exception as e:
-                            log.debug("Text delta callback error in Ollama streaming: %s", e)
+                            log.error("Text delta callback error in Ollama streaming: %s", e)
 
                     for tc_delta in msg.get("tool_calls") or []:
                         idx = tc_delta.get("index", 0)
@@ -2176,6 +2319,8 @@ class LLMClient:
                 message: dict[str, Any] = {"content": "".join(text_parts)}
                 if tool_calls:
                     message["tool_calls"] = tool_calls
+                if on_stream_event is not None:
+                    on_stream_event({"type": "text_end"})
                 return {"finish_reason": finish_reason, "message": message}
 
         except urllib.error.URLError as e:
@@ -2183,14 +2328,14 @@ class LLMClient:
         except Exception as e:
             return {"error": f"Ollama streaming request failed: {e}"}
 
-    def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+    def _stream_anthropic(self, system: str, tools: list[dict], on_stream_event) -> dict[str, Any]:
         """Call Anthropic API with streaming enabled.
 
         Uses in-process urllib for true SSE streaming when SSL is available;
         otherwise relays the SSE stream through the plugin-venv Python
         subprocess (_subprocess_sse_stream, fmt="anthropic").  Both paths
         stream — there is no non-streaming fallback here; _call_anthropic is
-        used only by callers without on_text_delta (e.g. history compaction).
+        used only by callers without on_stream_event (e.g. history compaction).
         """
         global _in_process_ssl
         import urllib.error
@@ -2233,6 +2378,8 @@ class LLMClient:
             try:
                 with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
                     _in_process_ssl = True
+                    if on_stream_event is not None:
+                        on_stream_event({"type": "text_start"})
                     text_blocks: dict[int, str] = {}
                     tool_blocks: dict[int, dict] = {}
                     stop_reason = "end_turn"
@@ -2278,9 +2425,9 @@ class LLMClient:
                                 text_blocks[idx] = text_blocks.get(idx, "") + chunk
                                 if chunk:
                                     try:
-                                        on_text_delta(chunk)
+                                        on_stream_event({"type": "text_chunk", "content": chunk})
                                     except Exception as e:
-                                        log.debug("Anthropic text delta callback error: %s", e)
+                                        log.error("Anthropic text delta callback error: %s", e)
                             elif dtype == "input_json_delta":
                                 partial = delta.get("partial_json", "")
                                 if idx in tool_blocks:
@@ -2322,6 +2469,8 @@ class LLMClient:
                     finish = "tool_calls" if tool_calls else "stop"
                     if stop_reason == "max_tokens":
                         finish = "stop"
+                    if on_stream_event is not None:
+                        on_stream_event({"type": "text_end"})
                     return {"finish_reason": finish, "message": message_out}
 
             except urllib.error.HTTPError as e:
@@ -2336,7 +2485,7 @@ class LLMClient:
 
         # In-process SSL unavailable: stream via the plugin-venv Python subprocess.
         return _subprocess_sse_stream(
-            url, headers, encoded, timeout=300, fmt="anthropic", on_text_delta=on_text_delta
+            url, headers, encoded, timeout=300, fmt="anthropic", on_stream_event=on_stream_event
         )
 
     def _anthropic_headers(self) -> dict[str, str]:

@@ -428,24 +428,43 @@ class TestSetComponentProperty:
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="Value",
-                property_value="999k",
+                items=[{"reference": "R1", "property_name": "Value", "property_value": "999k"}],
             )
         )
         assert result.get("success") is True, result
-        assert result["action"] == "updated"
-        assert result["units_where_updated"] == 1
-        assert result["units_where_added"] == 0
+        assert result["results"][0]["action"] == "updated"
+        assert result["results"][0]["units_where_updated"] == 1
+        assert result["results"][0]["units_where_added"] == 0
+
+    def test_different_properties_per_item(self, tools, tmp_sch):
+        """Each items entry carries its own property/value pair."""
+        result = asyncio.run(
+            tools["set_symbol_property"](
+                schematic_path=tmp_sch,
+                items=[
+                    {"reference": "R1", "property_name": "Value", "property_value": "22k"},
+                    {
+                        "reference": "R2",
+                        "property_name": "MPN",
+                        "property_value": "RC0402FR-0710KL",
+                    },
+                ],
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["applied_count"] == 2
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][0]["action"] == "updated"
+        assert result["results"][1]["reference"] == "R2"
+        assert result["results"][1]["action"] == "added"
+        assert result["results"][1]["units_where_added"] == 1
 
     def test_update_persists_after_write(self, tools, tmp_sch):
         """The updated Value should be readable from the written file."""
         asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="Value",
-                property_value="47k",
+                items=[{"reference": "R1", "property_name": "Value", "property_value": "47k"}],
             )
         )
         sch = skip.Schematic(tmp_sch)
@@ -463,24 +482,24 @@ class TestSetComponentProperty:
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="MPN",
-                property_value="RC0402FR-0710KL",
+                items=[
+                    {"reference": "R1", "property_name": "MPN", "property_value": "RC0402FR-0710KL"}
+                ],
             )
         )
         assert result.get("success") is True, result
-        assert result["action"] == "added"
-        assert result["units_where_added"] == 1
-        assert result["units_where_updated"] == 0
+        assert result["results"][0]["action"] == "added"
+        assert result["results"][0]["units_where_added"] == 1
+        assert result["results"][0]["units_where_updated"] == 0
 
     def test_new_property_persists_after_write(self, tools, tmp_sch):
         """A newly added property should be readable from the written file."""
         asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="MPN",
-                property_value="RC0402FR-0710KL",
+                items=[
+                    {"reference": "R1", "property_name": "MPN", "property_value": "RC0402FR-0710KL"}
+                ],
             )
         )
         sch = skip.Schematic(tmp_sch)
@@ -501,9 +520,9 @@ class TestSetComponentProperty:
         asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="Manufacturer",
-                property_value="Yageo",
+                items=[
+                    {"reference": "R1", "property_name": "Manufacturer", "property_value": "Yageo"}
+                ],
             )
         )
         sch = skip.Schematic(tmp_sch)
@@ -549,33 +568,30 @@ class TestSetComponentProperty:
         asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="Value",
-                property_value="1k",
+                items=[{"reference": "R1", "property_name": "Value", "property_value": "1k"}],
             )
         )
         assert os.path.exists(tmp_sch + ".bak")
 
     def test_reference_not_found_returns_error(self, tools, tmp_sch):
-        """An unknown reference should return an error dict."""
+        """An unknown reference yields a per-reference error, not a call failure."""
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="Z99",
-                property_name="Value",
-                property_value="1k",
+                items=[{"reference": "Z99", "property_name": "Value", "property_value": "1k"}],
             )
         )
-        assert "error" in result
+        assert result.get("success") is False, result
+        assert result["results"][0]["reference"] == "Z99"
+        assert "error" in result["results"][0]
+        assert result["applied_count"] == 0
 
     def test_empty_reference_returns_error(self, tools, tmp_sch):
         """An empty reference string should be rejected."""
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="",
-                property_name="Value",
-                property_value="1k",
+                items=[{"reference": "", "property_name": "Value", "property_value": "1k"}],
             )
         )
         assert "error" in result
@@ -585,21 +601,93 @@ class TestSetComponentProperty:
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="",
-                property_value="1k",
+                items=[{"reference": "R1", "property_name": "", "property_value": "1k"}],
             )
         )
         assert "error" in result
+
+    def test_unknown_item_field_rejected(self, tools, tmp_sch):
+        result = asyncio.run(
+            tools["set_symbol_property"](
+                schematic_path=tmp_sch,
+                items=[
+                    {
+                        "reference": "R1",
+                        "property_name": "Value",
+                        "property_value": "1k",
+                        "bogus": 1,
+                    }
+                ],
+            )
+        )
+        assert "error" in result
+        assert "bogus" in result["error"]
+
+    def test_partial_mutation_rolled_back_on_failure(self, tools, tmp_sch, monkeypatch):
+        """If applying an item fails mid-way, its partial tree mutation must
+        not reach the saved file (partial-apply contract)."""
+        import kcaa.tools.symbol_edit_tools as sym_tools
+
+        real_safe = sym_tools.safe_schematic
+        calls = {"n": 0}
+
+        def fake_safe(path):
+            calls["n"] += 1
+            sch = real_safe(path)
+            if calls["n"] == 1:
+                # First parse: make R2's clone SUCCEED (attaching a property
+                # to the tree — a genuine partial mutation) and then raise.
+                for sym in sch.symbol:
+                    try:
+                        if sym.property.Reference.value == "R2":
+                            orig_clone = sym.property.Value.clone
+
+                            def bad_clone(_orig_clone=orig_clone, *a, **k):
+                                _orig_clone(*a, **k)
+                                raise RuntimeError("simulated post-clone failure")
+
+                            sym.property.Value.clone = bad_clone
+                            break
+                    except AttributeError:
+                        continue
+            return sch
+
+        monkeypatch.setattr(sym_tools, "safe_schematic", fake_safe)
+
+        result = asyncio.run(
+            tools["set_symbol_property"](
+                schematic_path=tmp_sch,
+                items=[
+                    {"reference": "R1", "property_name": "Value", "property_value": "22k"},
+                    {"reference": "R2", "property_name": "MPN", "property_value": "X1"},
+                ],
+            )
+        )
+        assert result["applied_count"] == 1, result
+        assert result["failure_count"] == 1, result
+        assert "error" in result["results"][1]
+
+        # The written file must contain R1's change but NOT the failed
+        # item's partial residue (no stray duplicate Value/MPN on R2).
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                ref = sym.property.Reference.value
+            except AttributeError:
+                continue
+            if ref == "R1":
+                assert sym.property.Value.value == "22k"
+            elif ref == "R2":
+                names = [p.children[0] for p in sym.property]
+                assert names.count("Value") == 1, names
+                assert "MPN" not in names
 
     def test_invalid_extension_returns_error(self, tools):
         """A non-.kicad_sch path should be rejected immediately."""
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path="/tmp/bogus.txt",
-                reference="R1",
-                property_name="Value",
-                property_value="1k",
+                items=[{"reference": "R1", "property_name": "Value", "property_value": "1k"}],
             )
         )
         assert "error" in result
@@ -609,23 +697,23 @@ class TestSetComponentProperty:
         asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="MPN",
-                property_value="RC0402FR-0710KL",
+                items=[
+                    {"reference": "R1", "property_name": "MPN", "property_value": "RC0402FR-0710KL"}
+                ],
             )
         )
         result2 = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="MPN",
-                property_value="RC0402FR-0710KL",
+                items=[
+                    {"reference": "R1", "property_name": "MPN", "property_value": "RC0402FR-0710KL"}
+                ],
             )
         )
         # Second call should update (not add) the existing property.
         assert result2.get("success") is True, result2
-        assert result2["action"] == "updated", (
-            f"Second call should be 'updated', got {result2['action']!r}"
+        assert result2["results"][0]["action"] == "updated", (
+            f"Second call should be 'updated', got {result2['results'][0]['action']!r}"
         )
         # Reload from disk: exactly one MPN property should exist.
         sch = skip.Schematic(tmp_sch)
@@ -646,23 +734,19 @@ class TestSetComponentProperty:
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="Value",
-                property_value="2k2",
+                items=[{"reference": "R1", "property_name": "Value", "property_value": "2k2"}],
             )
         )
         assert result.get("success") is True, result
         # tools_test.kicad_sch has single-unit symbols; R1 has 1 unit.
-        assert result["units_updated"] == 1
+        assert result["results"][0]["units_updated"] == 1
 
     def test_empty_property_value_accepted(self, tools, tmp_sch):
         """An empty property_value is valid and should be persisted."""
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="Value",
-                property_value="",
+                items=[{"reference": "R1", "property_name": "Value", "property_value": ""}],
             )
         )
         assert result.get("success") is True, result
@@ -681,9 +765,7 @@ class TestSetComponentProperty:
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path="/tmp/does_not_exist.kicad_sch",
-                reference="R1",
-                property_name="Value",
-                property_value="1k",
+                items=[{"reference": "R1", "property_name": "Value", "property_value": "1k"}],
             )
         )
         assert "error" in result
@@ -699,9 +781,9 @@ class TestSetComponentProperty:
         result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="Footprint",
-                property_value="R_0402",
+                items=[
+                    {"reference": "R1", "property_name": "Footprint", "property_value": "R_0402"}
+                ],
             )
         )
         assert result.get("success") is True, result
@@ -768,12 +850,12 @@ class TestListComponentProperties:
         result = asyncio.run(
             tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
-                reference="R1",
+                references=["R1"],
             )
         )
         assert result.get("success") is True, result
-        assert result["reference"] == "R1"
-        names = [p["name"] for p in result["properties"]]
+        assert result["results"][0]["reference"] == "R1"
+        names = [p["name"] for p in result["results"][0]["properties"]]
         assert "Reference" in names
         assert "Value" in names
 
@@ -782,11 +864,11 @@ class TestListComponentProperties:
         result = asyncio.run(
             tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
-                reference="R1",
+                references=["R1"],
             )
         )
         assert result.get("success") is True, result
-        by_name = {p["name"]: p["value"] for p in result["properties"]}
+        by_name = {p["name"]: p["value"] for p in result["results"][0]["properties"]}
         assert by_name["Reference"] == "R1"
         assert by_name["Value"] == "R_Small"
 
@@ -795,17 +877,18 @@ class TestListComponentProperties:
         result = asyncio.run(
             tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
-                reference="Z99",
+                references=["Z99"],
             )
         )
-        assert "error" in result
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][0]
 
     def test_empty_reference_returns_error(self, tools, tmp_sch):
         """An empty reference string should be rejected."""
         result = asyncio.run(
             tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
-                reference="",
+                references=[""],
             )
         )
         assert "error" in result
@@ -815,7 +898,7 @@ class TestListComponentProperties:
         result = asyncio.run(
             tools["list_symbol_properties"](
                 schematic_path="/tmp/bogus.txt",
-                reference="R1",
+                references=["R1"],
             )
         )
         assert "error" in result
@@ -825,7 +908,7 @@ class TestListComponentProperties:
         result = asyncio.run(
             tools["list_symbol_properties"](
                 schematic_path="/tmp/does_not_exist.kicad_sch",
-                reference="R1",
+                references=["R1"],
             )
         )
         assert "error" in result
@@ -835,30 +918,54 @@ class TestListComponentProperties:
         asyncio.run(
             tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
-                reference="R1",
+                references=["R1"],
             )
         )
         assert not os.path.exists(tmp_sch + ".bak")
+
+    def test_batch_multiple_references(self, tools, tmp_sch):
+        """One call lists properties for several components."""
+        result = asyncio.run(
+            tools["list_symbol_properties"](
+                schematic_path=tmp_sch,
+                references=["R1", "R2"],
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["count"] == 2
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][1]["reference"] == "R2"
+        assert "Value" in {p["name"] for p in result["results"][1]["properties"]}
+
+    def test_duplicate_references_rejected(self, tools, tmp_sch):
+        result = asyncio.run(
+            tools["list_symbol_properties"](
+                schematic_path=tmp_sch,
+                references=["R1", "R1"],
+            )
+        )
+        assert "error" in result
+        assert "duplicate" in result["error"]
 
     def test_round_trip_with_set_property(self, tools, tmp_sch):
         """A property added via set_symbol_property should appear in the list."""
         add_result = asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name="MPN",
-                property_value="RC0402FR-0710KL",
+                items=[
+                    {"reference": "R1", "property_name": "MPN", "property_value": "RC0402FR-0710KL"}
+                ],
             )
         )
         assert add_result.get("success") is True, f"Setup failed: {add_result}"
         result = asyncio.run(
             tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
-                reference="R1",
+                references=["R1"],
             )
         )
         assert result.get("success") is True, result
-        by_name = {p["name"]: p["value"] for p in result["properties"]}
+        by_name = {p["name"]: p["value"] for p in result["results"][0]["properties"]}
         assert "MPN" in by_name, f"MPN not found in properties: {list(by_name)}"
         assert by_name["MPN"] == "RC0402FR-0710KL"
 
@@ -874,9 +981,7 @@ class TestDeleteComponentProperty:
         return asyncio.run(
             tools["set_symbol_property"](
                 schematic_path=tmp_sch,
-                reference="R1",
-                property_name=name,
-                property_value=value,
+                items=[{"reference": "R1", "property_name": name, "property_value": value}],
             )
         )
 

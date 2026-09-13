@@ -19,6 +19,8 @@ import os
 import threading
 from typing import Any
 
+from .stream_events import apply_stream_event, make_ai_entry
+
 log = logging.getLogger(__name__)
 
 try:
@@ -91,14 +93,25 @@ if _WX_AVAILABLE:
             self._server_mgr = server_mgr
             self._settings = settings
             self._llm_client: Any | None = None
+            self._fp_sync_pending: str | None = None
             # True once the MCP backend reported a successful start; the LLM
             # client is only created when this and panel display both hold.
             self._server_ready: bool = False
             self._busy = False
             # threading.Event for cancelling an in-progress LLM turn
             self._cancel_event: threading.Event | None = None
-            # Thread-safe buffer for streamed text chunks; drained by _stream_timer
-            self._stream_buffer: collections.deque = collections.deque()
+            # FIFO of stream-lifecycle events produced by the background LLM
+            # thread (text_start/text_chunk/text_end/tool_call/turn_end).
+            # The 50 ms _stream_timer is the ONLY consumer; it drains the
+            # queue in order and renders once per tick.
+            self._stream_events: collections.deque = collections.deque()
+            # Generation of the active turn.  Every event carries the
+            # generation it was emitted under; the consumer drops events of
+            # older turns (a cancelled turn's leftover text and turn_end).
+            self._event_gen: int = 0
+            # True once any text chunk of the active turn was consumed
+            # (replaces the old was_streamed / ai_turn_started tracking).
+            self._turn_had_text: bool = False
             # Set to True when at least one tool call happens during a turn
             self._tool_calls_made: bool = False
             # Set to True when any tool modifies a .kicad_sch file this turn
@@ -121,9 +134,6 @@ if _WX_AVAILABLE:
             # Keep the conversation pinned to the newest output while one AI
             # turn is actively streaming / appending tool results.
             self._follow_output_to_bottom: bool = False
-            # Monotonic counter for tool call sequence IDs (used by shell.js for
-            # unique details element IDs).
-            self._tool_seq: int = 0
             # True while SetPage(shell) is in-flight.  Only relevant during
             # initial shell load — subsequent updates use RunScript, not SetPage.
             self._page_loading: bool = False
@@ -155,11 +165,13 @@ if _WX_AVAILABLE:
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
             self._active_project: str | None = None
-            # Project-switch confirmation: first differing reading is held
-            # here and only acted on when the next tick agrees.
-            self._watch_candidate: str | None = None
-            self._watch_candidate_seen: bool = False
             self._project_watch_timer = wx.Timer(self)
+            # Version-based dirty tracking: _conv_version bumps on every
+            # conversation mutation; saves skip the write when the last
+            # successful save already covered the current version (a plain
+            # close must not rewrite — and re-stamp — the session file).
+            self._conv_version: int = 0
+            self._saved_conv_version: int = 0
 
             self._build_ui()
             self._start_server()
@@ -526,6 +538,11 @@ if _WX_AVAILABLE:
                     # up (panel shown early), inject the URL now.
                     if self._llm_client is not None:
                         self._llm_client.set_base_url(self._server_mgr.base_url)
+                    # Flush any footprint sync parked before the backend was up.
+                    if self._fp_sync_pending:
+                        project = self._fp_sync_pending
+                        self._fp_sync_pending = None
+                        self._start_footprint_sync(project)
                 else:
                     self._server_ready = False
                     self._set_status(
@@ -546,6 +563,10 @@ if _WX_AVAILABLE:
                 self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
                 self._autoload_session()
                 self._start_project_watch()
+                # Auto-sync the footprint index for the current project
+                # (deferred until the backend is up if needed).
+                if self._active_project:
+                    self._request_footprint_sync(self._active_project)
             except Exception as e:
                 import traceback
 
@@ -568,10 +589,21 @@ if _WX_AVAILABLE:
             elif event.IsShown():
                 try:
                     project = self._collect_active_project()
-                    if project != self._active_project and not self._busy:
+                    log.debug(
+                        "panel show: probe=%r active=%r busy=%r",
+                        project,
+                        self._active_project,
+                        self._busy,
+                    )
+                    if project is not None and project != self._active_project and not self._busy:
+                        log.info(
+                            "panel show: project re-sync %r -> %r; re-running restore flow",
+                            self._active_project,
+                            project,
+                        )
                         self._active_project = project
-                        self._watch_candidate_seen = False
-                        self._autoload_session()
+                        self._autoload_session(prompt_if_missing=True)
+                        self._request_footprint_sync(project)
                 except Exception:
                     log.debug("project re-sync on panel show failed", exc_info=True)
             event.Skip()
@@ -609,7 +641,7 @@ if _WX_AVAILABLE:
                 kipy_found = os.path.isdir(win_site)
             kipy_ok = kipy_found
             if not kipy_ok:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": (
@@ -658,7 +690,7 @@ if _WX_AVAILABLE:
         def _on_ipc_socket_checked(self, socket_exists: bool, checked_path: str) -> None:
             """Callback invoked on the UI thread after the async IPC socket check."""
             if not socket_exists:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": (
@@ -721,151 +753,235 @@ if _WX_AVAILABLE:
         # ------------------------------------------------------------------ #
 
         def _on_send(self, event) -> None:
+            """Chat send button / Enter: route a user message (chat kind)."""
+            self._send_request("chat", {})
+
+        def _send_request(self, kind: str, payload: dict) -> None:
+            """Route a request through the shared turn pipeline.
+
+            kind == "chat": user chat message → LLM loop (original _on_send
+            flow: input clear, user entry, context collection, PDF
+            extraction).
+            kind == "tool_direct": framework tool call (e.g. the auto
+            footprint sync) — executed directly via LLMClient.run's
+            tool_direct branch, never sent to the LLM; only the tool call
+            pair lands in history so the next request sees it and
+            llm_history persists it.  The request itself is not stored.
+
+            Shared skeleton: busy guard, generation-scoped event queue,
+            background thread, turn_end → _finish_turn (session save, busy
+            reset).
+            """
             if self._busy or not self._llm_client:
                 log.debug(
-                    "_on_send: skipped (busy=%s, client=%s)",
+                    "_send_request(%s): skipped (busy=%s, client=%s)",
+                    kind,
                     self._busy,
                     self._llm_client is not None,
                 )
                 return
-            if not self._server_ready:
-                log.debug("_on_send: skipped (backend not ready)")
-                return
-            text = self._input.GetValue().strip()
-            images = self._encode_attached_images()
-            pdfs = [p for p, t in self._attached_files if t == "pdf"]
-            if not text and not images and not pdfs:
-                return
-            if images and not self._settings.llm_supports_vision:
+
+            ctx: dict = {}
+            context_block = ""
+            text = ""
+            images = []
+            pdfs = []
+            _user_entry: dict | None = None
+            if kind == "chat":
+                if not self._server_ready:
+                    log.debug("_on_send: skipped (backend not ready)")
+                    return
+                text = self._input.GetValue().strip()
+                images = self._encode_attached_images()
+                pdfs = [p for p, t in self._attached_files if t == "pdf"]
+                if not text and not images and not pdfs:
+                    return
+                if images and not self._settings.llm_supports_vision:
+                    log.info(
+                        "_on_send: blocked — %d image(s) but vision disabled in settings",
+                        len(images),
+                    )
+                    wx.MessageBox(
+                        "The current model is configured as not supporting vision. "
+                        'Enable "Model supports vision" in Settings or remove the attached '
+                        "image(s) before sending.",
+                        "Vision not enabled",
+                        wx.OK | wx.ICON_WARNING,
+                        self,
+                    )
+                    return
                 log.info(
-                    "_on_send: blocked — %d image(s) but vision disabled in settings",
+                    "_on_send: user message (%d chars, %d image(s), %d PDF(s), vision=%s)",
+                    len(text),
                     len(images),
+                    len(pdfs),
+                    self._settings.llm_supports_vision,
                 )
-                wx.MessageBox(
-                    "The current model is configured as not supporting vision. "
-                    'Enable "Model supports vision" in Settings or remove the attached '
-                    "image(s) before sending.",
-                    "Vision not enabled",
-                    wx.OK | wx.ICON_WARNING,
-                    self,
+                self._input.Clear()
+                display_text = text or "(attachment)"
+                if images:
+                    display_text += f"\n\n[📎 {len(images)} image(s) attached]"
+                if pdfs:
+                    display_text += f"\n\n[📄 {len(pdfs)} PDF(s) attached]"
+                # Placeholder — pdf_texts filled in after background extraction
+                self._conv_entries.append(
+                    {
+                        "type": "user",
+                        "text": display_text,
+                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                        "pdf_texts": [],
+                    }
                 )
-                return
-            log.info(
-                "_on_send: user message (%d chars, %d image(s), %d PDF(s), vision=%s)",
-                len(text),
-                len(images),
-                len(pdfs),
-                self._settings.llm_supports_vision,
-            )
-            self._input.Clear()
-            display_text = text or "(attachment)"
-            if images:
-                display_text += f"\n\n[📎 {len(images)} image(s) attached]"
-            if pdfs:
-                display_text += f"\n\n[📄 {len(pdfs)} PDF(s) attached]"
-            # Placeholder — pdf_texts filled in after background extraction
-            self._conv_entries.append(
-                {
-                    "type": "user",
-                    "text": display_text,
-                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                    "pdf_texts": [],
-                }
-            )
-            _user_entry = self._conv_entries[-1]
-            self._attached_files.clear()
-            self._refresh_attachments_bar()
-            self._follow_output_to_bottom = True
-            # Persist on every user message: creates the file on the first
-            # message (so current.json exists before the AI responds) and makes
-            # the session durable immediately (also upgrading legacy v1 files
-            # to v2, since the user has now modified the session).
-            err = self._save_session_to_disk()
-            if err:
-                log.warning("Could not save session: %s", err)
-            self._render_conversation(force_scroll_to_bottom=True)
+                _user_entry = self._conv_entries[-1]
+                self._conv_version += 1
+                self._attached_files.clear()
+                self._refresh_attachments_bar()
+                self._follow_output_to_bottom = True
+                self._render_conversation(force_scroll_to_bottom=True)
+
+            # Busy from here on: the turn owns the UI until turn_end.
             self._busy = True
             self._cancel_event = threading.Event()
             self._toggle_send_stop(busy=True)
 
             from ..context_bridge import collect_context, context_to_system_prompt_block
 
-            ctx = collect_context()
-            context_block = context_to_system_prompt_block(ctx)
+            if kind == "chat":
+                ctx = collect_context()
+                context_block = context_to_system_prompt_block(ctx)
+            else:
+                log.info("_send_request(tool_direct): %s", payload.get("name"))
 
-            # Reset streaming state and start the flush timer
-            self._stream_buffer.clear()
+            # Reset streaming state and start the flush timer.  A new turn
+            # bumps the generation: events still in flight from a cancelled
+            # previous turn are then ignored by the consumer (see
+            # _on_stream_flush), while their tool cards still land.
+            self._stream_events.clear()
             self._pending_ai_text = ""
             self._stream_delta_chars = 0
             self._tool_calls_made = False
             self._schematic_edited = False
             self._pcb_edited = False
+            self._turn_had_text = False
+            self._event_gen += 1
             self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
 
-            state = {"ai_turn_started": False}
+            gen = self._event_gen
 
-            def _on_delta(chunk: str) -> None:
-                # Called from background thread — just push to buffer; timer handles UI
-                if self._cancel_event and self._cancel_event.is_set():
-                    if not state.get("cancel_dropped"):
-                        state["cancel_dropped"] = True
-                        log.debug("chat: dropping streamed chunks after cancel")
+            def _emit(evt: dict) -> None:
+                # Sole producer (background thread): every lifecycle event
+                # carries this turn's generation; FIFO order == occurrence
+                # order by construction.  Drop events if the panel has moved
+                # on (New Session / Clear bumped _event_gen) so a cancelled
+                # turn whose thread keeps streaming cannot grow the deque
+                # unbounded.
+                if gen != self._event_gen:
                     return
-                state["ai_turn_started"] = True
-                self._stream_delta_chars += len(chunk)
-                self._stream_buffer.append(chunk)
+                evt = dict(evt)
+                evt["_gen"] = gen
+                self._stream_events.append(evt)
+
+            def _on_tool(name, args, result) -> None:
+                """UI callback for every tool execution in this turn."""
+                _emit({"type": "tool_call", "name": name, "args": args, "result": result})
+                if kind == "tool_direct" and name == "sync_footprint_index":
+                    # Mirror the old auto-sync status notices: started /
+                    # failed surface as status entries, already_running is
+                    # silent (the tool card alone tells the story).
+                    status = (result or {}).get("status") if isinstance(result, dict) else None
+                    if status == "already_running":
+                        log.debug("footprint sync: already running — skipping")
+                    elif isinstance(result, dict) and (
+                        result.get("success") is False or result.get("error")
+                    ):
+                        _emit(
+                            {
+                                "type": "status",
+                                "text": "⚠ Footprint index sync failed: %s"
+                                % (result.get("error") or result),
+                                "color_hex": self._C_ERR_HEX,
+                            }
+                        )
+                    else:
+                        _emit(
+                            {
+                                "type": "status",
+                                "text": (
+                                    "⟳ Footprint index sync started in the background "
+                                    "for this project."
+                                ),
+                                "color_hex": self._C_WARN_HEX,
+                            }
+                        )
 
             def _run():
-                log.info("Background _run: started")
+                log.info("Background _run (%s): started", kind)
                 try:
-                    # Extract PDF text before sending to LLM
-                    text_with_pdf = text
-                    if pdfs:
-                        self._set_status("⏳ Extracting PDF text…", self._C_WARN)
-                        pdf_texts: list[dict] = []
-                        pdf_blocks: list[str] = []
-                        for pdf_path in pdfs:
-                            extracted = self._extract_pdf_text(pdf_path)
-                            basename = os.path.basename(pdf_path)
-                            if extracted.startswith("[Error]"):
-                                log.error("PDF extraction failed: %s — %s", pdf_path, extracted)
-                                pdf_texts.append(
-                                    {"name": basename, "text": extracted, "error": True}
-                                )
-                                pdf_blocks.append(f"--- PDF: {basename} ---\n{extracted}")
-                            else:
-                                log.info("PDF extracted: %s → %d chars", basename, len(extracted))
-                                pdf_texts.append({"name": basename, "text": extracted})
-                                pdf_blocks.append(
-                                    f"--- PDF: {basename} "
-                                    f"(text extracted with page numbers) ---\n\n{extracted}"
-                                )
-                        self._set_status("Ready", self._C_OK)
-                        # Store extracted texts for UI display
-                        _user_entry["pdf_texts"] = pdf_texts
-                        if pdf_blocks:
-                            pdf_block = "\n\n".join(pdf_blocks)
-                            text_with_pdf = text + ("\n\n" if text else "") + pdf_block
-                        # Re-render so the collapsible PDF text appears
-                        wx.CallAfter(self._render_conversation, True)
-                    reply = self._llm_client.run(
-                        text_with_pdf,
-                        context_block,
-                        on_tool_call=lambda name, args, result: wx.CallAfter(
-                            self._on_tool_call, name, args, result
-                        ),
-                        on_text_delta=_on_delta,
-                        images=images,
-                    )
+                    if kind == "chat":
+                        # Extract PDF text before sending to LLM
+                        text_with_pdf = text
+                        if pdfs:
+                            self._set_status("⏳ Extracting PDF text…", self._C_WARN)
+                            pdf_texts: list[dict] = []
+                            pdf_blocks: list[str] = []
+                            for pdf_path in pdfs:
+                                extracted = self._extract_pdf_text(pdf_path)
+                                basename = os.path.basename(pdf_path)
+                                if extracted.startswith("[Error]"):
+                                    log.error("PDF extraction failed: %s — %s", pdf_path, extracted)
+                                    pdf_texts.append(
+                                        {"name": basename, "text": extracted, "error": True}
+                                    )
+                                    pdf_blocks.append(f"--- PDF: {basename} ---\n{extracted}")
+                                else:
+                                    log.info(
+                                        "PDF extracted: %s → %d chars", basename, len(extracted)
+                                    )
+                                    pdf_texts.append({"name": basename, "text": extracted})
+                                    pdf_blocks.append(
+                                        f"--- PDF: {basename} "
+                                        f"(text extracted with page numbers) ---\n\n{extracted}"
+                                    )
+                            self._set_status("Ready", self._C_OK)
+                            # Store extracted texts for UI display
+                            if _user_entry is not None:
+                                _user_entry["pdf_texts"] = pdf_texts
+                            if pdf_blocks:
+                                pdf_block = "\n\n".join(pdf_blocks)
+                                text_with_pdf = text + ("\n\n" if text else "") + pdf_block
+                            # Re-render so the collapsible PDF text appears
+                            wx.CallAfter(self._render_conversation, True)
+                        reply = self._llm_client.run(
+                            text_with_pdf,
+                            context_block,
+                            on_tool_call=_on_tool,
+                            on_stream_event=_emit,
+                            on_compacted=lambda notice: _emit(
+                                {"type": "status", "text": notice, "color_hex": self._C_WARN_HEX}
+                            ),
+                            images=images,
+                        )
+                    else:  # tool_direct
+                        self._llm_client.run(
+                            {
+                                "kind": "tool_direct",
+                                "name": payload.get("name") or "",
+                                "arguments": payload.get("arguments") or {},
+                            },
+                            context_block,
+                            on_tool_call=_on_tool,
+                        )
+                        # tool_direct produces no assistant text: keep the
+                        # turn_end reply empty so no AI entry is rendered.
+                        reply = ""
                 except Exception as e:
                     log.exception("LLM request failed")
                     reply = f"[Error] {e}"
-                log.info(
-                    "Background _run: finished (reply_len=%d, streamed=%s)",
-                    len(reply),
-                    state["ai_turn_started"],
-                )
-                wx.CallAfter(self._on_reply, reply, ctx, was_streamed=state["ai_turn_started"])
+                log.info("Background _run (%s): finished (reply_len=%d)", kind, len(reply))
+                # turn_end is the queue's final event: emitted after the
+                # reload_kicad / tool callbacks, so the consumer orders it
+                # strictly after the last text of the turn.
+                _emit({"type": "turn_end", "reply": reply, "ctx": ctx})
 
             threading.Thread(target=_run, daemon=True).start()
 
@@ -1377,57 +1493,108 @@ if _WX_AVAILABLE:
                 return f"[Error] {err}"
             return result.stdout or ""
 
-        def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
-            # Stop the flush timer and drain any remaining chunks
-            self._stream_timer.Stop()
-            self._on_stream_flush(None)
+        def _on_stream_flush(self, event) -> None:
+            """Consume the unified stream-event queue (main thread, 50 ms timer).
 
+            Sole consumer: drains ALL queued events in FIFO order (occurrence
+            order is guaranteed by the single background producer) and applies
+            each via the wx-free state machine in stream_events, then performs
+            one merged render per tick.  A ``text_end`` is therefore always
+            applied before the ``tool_call`` / ``turn_end`` events that follow
+            it — the race where an end-of-turn notification (``reload_kicad``)
+            finalised a draft that was still being filled through the old
+            50 ms text pipeline is structurally impossible.  Draft
+            finalisation is driven by the explicit ``text_end`` marker, never
+            by heuristics about pending text.
+
+            Output paths are unchanged: only the input pipeline moved into
+            the queue.  Non-stream events (status bar, project switch,
+            session load) still go through wx directly.
+            """
+
+            if not self._stream_events:
+                return
+            events = []
+            while self._stream_events:
+                try:
+                    events.append(self._stream_events.popleft())
+                except IndexError:
+                    break
+
+            draft_changed = False
+            entries_changed = False
+            turn_ended = False
+            turn_ctx: dict = {}
+            for evt in events:
+                etype = evt.get("type")
+                if evt.get("_gen", -1) != self._event_gen:
+                    # Stale turn (cancelled or replaced by a newer send or
+                    # session reset): drop its text and turn-end; its tool
+                    # cards still land (pre-refactor behaviour — the old
+                    # _on_tool_call always reached the UI).
+                    if etype != "tool_call":
+                        continue
+
+                st = apply_stream_event(
+                    pending=self._pending_ai_text,
+                    entries=self._conv_entries,
+                    tool_calls_made=self._tool_calls_made,
+                    turn_had_text=self._turn_had_text,
+                    delta_chars=self._stream_delta_chars,
+                    cancelled=self._cancel_event is not None and self._cancel_event.is_set(),
+                    evt=evt,
+                    timestamp=lambda: datetime.datetime.now().strftime("%H:%M:%S"),
+                )
+                self._pending_ai_text = st.pending
+                self._tool_calls_made = st.tool_calls_made
+                self._turn_had_text = st.turn_had_text
+                self._stream_delta_chars = st.delta_chars
+                draft_changed |= st.draft_changed
+                entries_changed |= st.entries_changed
+                if st.entries_changed:
+                    self._conv_version += 1
+                if etype == "turn_end":
+                    turn_ended = True
+                    turn_ctx = evt.get("ctx") or {}
+                if etype == "tool_call" and evt.get("name"):
+                    self._mark_tool_dirty(evt["name"])
+
+            # One merged render pass per tick: incremental stream update for
+            # the draft, then a full conversation render for new entries.
+            if draft_changed:
+                if self._use_webview:
+                    if self._shell_loaded and not self._stream_wrapper_visible:
+                        self._show_stream_wrapper()
+                    if not self._incremental_stream_update():
+                        # Deferred (lock busy / shell not loaded) or update
+                        # failed: _run_script already recorded _render_pending,
+                        # so a full rebuild will replay (and the next flush
+                        # re-shows stream text).
+                        log.warning(
+                            "chat: stream flush deferred render (pending=%d chars)",
+                            len(self._pending_ai_text),
+                        )
+                else:
+                    self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+            if entries_changed or turn_ended:
+                self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+
+            if turn_ended:
+                self._finish_turn(turn_ctx)
+
+        def _finish_turn(self, ctx: dict) -> None:
+            """Close out a finished turn: hide preview, reset state, save.
+
+            Takes over the tail of the old _on_reply — everything that is not
+            part of the pure event state machine in stream_events.
+            """
             log.info(
-                "chat: _on_reply was_streamed=%s reply_len=%d pending_len=%d "
-                "buffer_left=%d delta_chars=%d",
-                was_streamed,
-                len(reply),
+                "chat: turn finished pending_len=%d delta_chars=%d",
                 len(self._pending_ai_text),
-                len(self._stream_buffer),
                 getattr(self, "_stream_delta_chars", 0),
             )
-
-            # Hide streaming preview before appending the final entry
             if self._use_webview:
                 self._hide_stream_wrapper()
-
-            if not was_streamed:
-                entry = {
-                    "type": "ai",
-                    "text": reply,
-                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                }
-                self._conv_entries.append(entry)
-                if self._use_webview and self._shell_loaded:
-                    self._append_entry_js(entry, force_scroll_to_bottom=True)
-                else:
-                    self._render_conversation(force_scroll_to_bottom=True)
-            else:
-                # Finalise any remaining streamed text as a proper AI entry
-                if self._pending_ai_text:
-                    entry = {
-                        "type": "ai",
-                        "text": self._pending_ai_text,
-                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                    }
-                    log.info(
-                        "chat: finalising streamed entry text_len=%d tail=%r",
-                        len(entry["text"]),
-                        entry["text"][-80:],
-                    )
-                    self._conv_entries.append(entry)
-                    self._pending_ai_text = ""
-                    if self._use_webview and self._shell_loaded:
-                        self._append_entry_js(entry, force_scroll_to_bottom=True)
-                    else:
-                        self._render_conversation(force_scroll_to_bottom=True)
-            # Any deferral during the turn is flushed by the lock holder's
-            # release (_run_script), so no turn-end safety net is needed.
             self._busy = False
             self._cancel_event = None
             self._toggle_send_stop(busy=False)
@@ -1435,44 +1602,14 @@ if _WX_AVAILABLE:
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
             self._follow_output_to_bottom = False
+            if not self._stream_events:
+                self._stream_timer.Stop()
             # Persist the completed turn so disk always holds the full
-            # conversation, including the streamed AI reply. On-exit autosave
-            # then only refreshes — no data depends on it.
+            # conversation.  Teardown persistence (Bug A) covers an
+            # in-flight close; this write covers the complete turn.
             err = self._save_session_to_disk()
             if err:
                 log.warning("Could not save session after reply: %s", err)
-
-        def _on_stream_flush(self, event) -> None:
-            """Drain the streaming buffer into the pending AI text (main thread, timer-driven)."""
-            if not self._stream_buffer:
-                return
-            parts = []
-            while self._stream_buffer:
-                try:
-                    parts.append(self._stream_buffer.popleft())
-                except IndexError:
-                    break
-            if not parts:
-                return
-            self._pending_ai_text += "".join(parts)
-
-            if self._use_webview:
-                # Show stream wrapper on first chunk
-                if self._shell_loaded and not self._stream_wrapper_visible:
-                    self._show_stream_wrapper()
-                # Incremental DOM update — should always succeed with shell loaded
-                if self._incremental_stream_update():
-                    return
-                # Deferred (lock busy / shell not loaded) or update failed:
-                # _run_script already recorded _render_pending, so a full
-                # rebuild will replay (and the next flush re-shows stream
-                # text).  Nothing to bookkeep here.
-                log.warning(
-                    "chat: stream flush deferred render (pending=%d chars)",
-                    len(self._pending_ai_text),
-                )
-            else:
-                self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
 
         def _incremental_stream_update(self) -> bool:
             """Update streaming AI text via _updateStream JS call.
@@ -1521,7 +1658,7 @@ if _WX_AVAILABLE:
                     "WebView shell failed to load after %d retries — giving up",
                     self._shell_retry_count,
                 )
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": (
@@ -1536,7 +1673,7 @@ if _WX_AVAILABLE:
             log.warning(
                 "WebView watchdog: shell load timed out (>5s), retry %d/3", self._shell_retry_count
             )
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "status",
                     "text": (
@@ -1548,40 +1685,8 @@ if _WX_AVAILABLE:
             )
             wx.CallAfter(self._load_shell)
 
-        def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
-            log.info(
-                "_on_tool_call: %s (shell_loaded=%s, entries=%d)",
-                name,
-                self._shell_loaded,
-                len(self._conv_entries),
-            )
-            # If there is pending streamed text that preceded this tool call,
-            # finalise it as an AI entry now so the timeline order is correct.
-            if self._pending_ai_text:
-                log.debug(
-                    "chat: mid-turn finalise of streamed text len=%d",
-                    len(self._pending_ai_text),
-                )
-                self._conv_entries.append({"type": "ai", "text": self._pending_ai_text})
-                self._pending_ai_text = ""
-            # Append as a permanent timeline entry so tool calls appear in
-            # chronological order alongside user and AI messages.
-            # Store full data — truncation for UI display happens at render time
-            # to preserve session data integrity.
-            self._tool_seq += 1
-            self._conv_entries.append(
-                {
-                    "type": "tool_call",
-                    "name": name,
-                    "args": args,
-                    "result": result,
-                    "_seq": self._tool_seq,
-                }
-            )
-            # Full update needed to clear pending-ai-text and show new entries
-            self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
-            self._tool_calls_made = True
-            # Use tool_registry to determine if tool modified PCB/schematic files
+        def _mark_tool_dirty(self, name: str) -> None:
+            """Track whether a tool call modified the PCB/schematic on disk."""
             try:
                 from ..tool_registry import get_tool_policy
 
@@ -1595,6 +1700,17 @@ if _WX_AVAILABLE:
             elif policy and policy.path_arg == "schematic_path" and policy.mark_dirty:
                 self._schematic_edited = True
 
+        def _append_entry(self, entry: dict) -> None:
+            """Append a conversation entry and mark the conversation dirty.
+
+            Every status / autoroute-log append goes through here so the
+            version-based save gate (``_save_session_to_disk``) cannot skip a
+            write that should persist them.  AI / user entries that already
+            bump ``_conv_version`` at their call site may append directly.
+            """
+            self._conv_entries.append(entry)
+            self._conv_version += 1
+
         def _auto_refresh(self, ctx: dict) -> None:
             """Refresh the KiCad view automatically after tool calls."""
             if self._pcb_edited:
@@ -1602,7 +1718,7 @@ if _WX_AVAILABLE:
                     import pcbnew
 
                     pcbnew.Refresh()
-                    self._conv_entries.append(
+                    self._append_entry(
                         {
                             "type": "status",
                             "text": "⟳ Board view refreshed.",
@@ -1613,7 +1729,7 @@ if _WX_AVAILABLE:
                 except ImportError:
                     pass  # outside KiCad — silently skip
                 except Exception as e:
-                    self._conv_entries.append(
+                    self._append_entry(
                         {
                             "type": "status",
                             "text": f"⚠ Auto-refresh failed: {e}",
@@ -1623,7 +1739,7 @@ if _WX_AVAILABLE:
                     self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
                     return
             if self._schematic_edited:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": "ℹ Schematic updated on disk — use File → Revert in the Schematic Editor to see the changes.",
@@ -1636,30 +1752,44 @@ if _WX_AVAILABLE:
             """Stop button: cancel the in-progress LLM turn."""
             if not self._busy or self._cancel_event is None:
                 return
-            log.info("_on_stop: cancelling LLM turn")
-            self._cancel_event.set()
-            # Drain stream buffer and finalise whatever text has arrived
-            self._stream_timer.Stop()
-            self._on_stream_flush(None)
+            # Drain any text chunks the producer already enqueued since the
+            # last timer tick before cancelling — otherwise the archived
+            # partial silently loses the tail received in the last tick
+            # window (the same truncation class Bug B fixes).  Only fold
+            # text_* of this turn; tool_call/turn_end are left for the timer.
+            gen = self._event_gen
+            for evt in list(self._stream_events):
+                if evt.get("_gen") != gen:
+                    continue
+                if evt.get("type") == "text_chunk":
+                    self._pending_ai_text += evt.get("content") or ""
+                    self._turn_had_text = True
+                    self._stream_delta_chars += len(evt.get("content") or "")
+            self._cancel_event.set()  # consumer drops subsequent text_* of this turn
             if self._use_webview:
                 self._hide_stream_wrapper()
+            # Finalise whatever text the consumer already moved into the draft.
+            # The queue keeps draining afterwards: later text events are
+            # dropped (cancel is set), tool cards still land, and the turn_end
+            # event clears the cancel flag when it arrives.
             if self._pending_ai_text:
-                entry = {
-                    "type": "ai",
-                    "text": self._pending_ai_text,
-                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                }
+                entry = make_ai_entry(
+                    self._pending_ai_text,
+                    datetime.datetime.now().strftime("%H:%M:%S"),
+                )
                 self._conv_entries.append(entry)
                 self._pending_ai_text = ""
+                self._conv_version += 1
                 if self._use_webview and self._shell_loaded:
                     self._append_entry_js(entry, force_scroll_to_bottom=True)
                 else:
                     self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
-            self._cancel_event = None
             self._toggle_send_stop(busy=False)
             # Persist what has been finalised so far — the turn was cancelled
-            # mid-flight and on-exit autosave is best-effort only.
+            # mid-flight and on-exit autosave is best-effort only.  Note the
+            # cancel event is intentionally left SET here; _finish_turn (via
+            # the turn_end event) resets it once the turn is truly drained.
             err = self._save_session_to_disk()
             if err:
                 log.warning("Could not save session after stop: %s", err)
@@ -1676,7 +1806,7 @@ if _WX_AVAILABLE:
             # Messages are blocked while the backend is down.
             self._server_ready = False
             self._sync_send_button_state()
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "status",
                     "text": "↺ Restarting MCP backend…",
@@ -1693,7 +1823,7 @@ if _WX_AVAILABLE:
 
         def _on_restart_done(self, ok: bool) -> None:
             if ok:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": "✅ Backend restarted successfully.",
@@ -1707,7 +1837,7 @@ if _WX_AVAILABLE:
                 self._init_llm_client()
                 self._on_server_started(True)
             else:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": "❌ Backend failed to restart.",
@@ -1896,7 +2026,7 @@ if _WX_AVAILABLE:
                 board = None
 
             if board is None:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": "⚠ No board is currently open. Open a .kicad_pcb file before running Auto Route.",
@@ -1990,15 +2120,15 @@ if _WX_AVAILABLE:
             backup_path = ""
             if board_path and os.path.isfile(board_path):
                 try:
-                    from ..llm_client import call_mcp_tool
+                    from ..llm_client import _project_path_for, call_mcp_tool
 
                     result = call_mcp_tool(
                         self._server_mgr.base_url,
-                        "save_file_version",
-                        {"file_path": board_path},
+                        "save_project_version",
+                        {"project_file": _project_path_for(board_path)},
                     )
-                    backup_path = result.get("snapshot_path", "")
-                    log.info("autoroute: version snapshot saved to %s", backup_path)
+                    backup_path = result.get("archive_path", "")
+                    log.info("autoroute: project version snapshot saved to %s", backup_path)
                 except Exception as exc:
                     log.warning("autoroute: version snapshot failed: %s", exc)
                     backup_path = ""
@@ -2007,7 +2137,7 @@ if _WX_AVAILABLE:
                 _pcbnew.ExportSpecctraDSN(board, dsn_path)
             except Exception as exc:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "autoroute_log",
                         "success": False,
@@ -2021,7 +2151,7 @@ if _WX_AVAILABLE:
 
             if not os.path.isfile(dsn_path):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "autoroute_log",
                         "success": False,
@@ -2038,7 +2168,7 @@ if _WX_AVAILABLE:
             self._set_status("⏳ Auto-routing in progress…", self._C_WARN)
             self.Layout()
 
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "status",
                     "text": "⏳ Auto Route started — running FreeRouting in background…",
@@ -2138,7 +2268,7 @@ if _WX_AVAILABLE:
                 )
 
             # ---- Append collapsible log entry ----
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "autoroute_log",
                     "success": success,
@@ -2172,17 +2302,41 @@ if _WX_AVAILABLE:
                 )
                 return
 
-            has_content = any(e["type"] in ("user", "ai") for e in self._conv_entries)
-            if has_content:
+            if not self._start_blank_session(save_first=True):
+                return
+
+        def _start_blank_session(self, save_first: bool) -> bool:
+            """Save (optionally) then clear everything for a blank session.
+
+            Shared by the New Session button and the "New session" entry in
+            the project session picker.  The picker path passes
+            ``save_first=False``: its session content is already persisted
+            turn-by-turn, and stamping it with the *new* ``_active_project``
+            would rewrite the old project's file ownership.
+            """
+            saved_previous = False
+            if save_first:
                 err = self._save_session_to_disk()
                 if err:
-                    wx.MessageBox(f"Could not save session:\n{err}", "Error", wx.OK | wx.ICON_ERROR)
-                    return
+                    wx.MessageBox(
+                        f"Could not save session:\n{err}",
+                        "Error",
+                        wx.OK | wx.ICON_ERROR,
+                    )
+                    return False
+                # The save guard skips empty / sync-only sessions, so
+                # "previous session saved" must reflect what actually
+                # happened, not just that save_first was requested.
+                saved_previous = self._saved_conv_version == self._conv_version
 
             # Clear conversation and LLM history for the new session.
             self._stream_timer.Stop()
-            self._stream_buffer.clear()
+            self._stream_events.clear()
+            self._event_gen += 1
+            self._turn_had_text = False
+            self._stream_delta_chars = 0
             self._conv_entries.clear()
+            self._conv_version += 1
             self._pending_ai_text = ""
             self._current_session_file = None
             self._render_conversation()
@@ -2195,17 +2349,65 @@ if _WX_AVAILABLE:
             _sstore.remove_current_link(self._settings.config_dir)
 
             self._set_status(
-                "✅ New session started" + (" (previous session saved)" if has_content else ""),
+                "✅ New session started" + (" (previous session saved)" if saved_previous else ""),
                 self._C_OK,
             )
             self.Layout()
+            return True
+
+        def _session_has_real_content(self) -> bool:
+            """True when the session holds real conversation — user text or
+            an AI reply — as opposed to an empty session or a lone auto
+            footprint sync turn.  Shared by the save guard, the New Session
+            save-first check, and teardown persistence.
+            """
+            if not self._conv_entries:
+                return False
+            if self._history_is_sync_only():
+                return False
+            return True
+
+        def _history_is_sync_only(self) -> bool:
+            """True when history is exactly the three messages an auto
+            footprint sync leaves behind: the synthetic user preamble, the
+            sync tool-call declaration, and its tool result.
+
+            The length check is the primary gate — any other turn count
+            means real messages were exchanged (user text, AI reply, or a
+            different tool), so the session must save normally.
+            """
+            from ..llm_client import FRAMEWORK_PREAMBLE
+
+            if self._llm_client is None:
+                return False
+            h = self._llm_client.get_history()
+            if len(h) != 3:
+                return False
+            # [0] synthetic user preamble
+            if h[0].get("role") != "user" or h[0].get("content") != FRAMEWORK_PREAMBLE:
+                return False
+            # [1] assistant declaring exactly the sync tool call
+            if h[1].get("role") != "assistant":
+                return False
+            tcs = h[1].get("tool_calls") or []
+            if len(tcs) != 1:
+                return False
+            if tcs[0].get("function", {}).get("name") != "sync_footprint_index":
+                return False
+            # [2] its tool result
+            if h[2].get("role") != "tool":
+                return False
+            return True
 
         def _save_session_to_disk(self) -> str | None:
             """Write current conv_entries + history to disk and update current.json.
 
             Sessions are stamped with the currently open KiCad project
             (schema v2), so a session never silently leaks into a different
-            project.  The stamp reflects the project active at save time.
+            project.  The stamp is the project watch's last-confirmed project
+            (``_active_project``), not a live probe: at teardown KiCad is
+            already exiting and ``pcbnew``/window-title probes return None,
+            which would clobber the session's project ownership (issue #108).
 
             If ``_current_session_file`` is already set the existing file is
             overwritten; otherwise a new timestamped file is created and
@@ -2215,12 +2417,37 @@ if _WX_AVAILABLE:
             """
             from .. import session_store as _sstore
 
+            # No conversation changes since the last successful save — skip
+            # the write entirely (and do not touch current.json).  A teardown
+            # save on a plain close is then a no-op instead of rewriting the
+            # file with a fresh timestamp / project stamp.
+            if self._conv_version == self._saved_conv_version:
+                return None
+
+            # A session with no real conversation must not be written or
+            # repointed — that would orphan a pointless file.  Two shapes
+            # are skipped: a completely empty session (nothing was said or
+            # done), and one holding only the auto footprint sync's tool
+            # turn (checked precisely against history below).  Any real
+            # content — a user message, an AI reply, or a non-sync tool
+            # call — saves normally.  Every caller (turn end, teardown,
+            # New Session) funnels through this single guard.
+            if not self._session_has_real_content():
+                return None
+
             if self._current_session_file:
                 filename = self._current_session_file
             else:
                 ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
                 filename = f"session_{ts}.json"
                 self._current_session_file = filename
+            log.info(
+                "save session: file=%s stamp=%r (conv_version=%d saved=%d)",
+                filename,
+                self._active_project,
+                self._conv_version,
+                self._saved_conv_version,
+            )
             payload = _sstore.make_payload(
                 self._conv_entries,
                 (
@@ -2228,12 +2455,13 @@ if _WX_AVAILABLE:
                     if self._llm_client
                     else []
                 ),
-                self._collect_active_project(),
+                self._active_project,
             )
             err = _sstore.save_session(self._settings.config_dir, filename, payload)
             if err:
                 return err
             _sstore.update_current_link(self._settings.config_dir, filename)
+            self._saved_conv_version = self._conv_version
             return None
 
         def _on_load_session(self, event) -> None:
@@ -2297,11 +2525,23 @@ if _WX_AVAILABLE:
                 wx.MessageBox(f"Could not load session:\n{err}", "Error", wx.OK | wx.ICON_ERROR)
                 return False
 
-            # Restore state
+            # Restore state.  Bump the generation so events still in flight
+            # from a previous turn are dropped by the consumer; if a turn was
+            # unexpectedly busy, leave it cancelled and clear the UI state.
             self._stream_timer.Stop()
-            self._stream_buffer.clear()
+            self._stream_events.clear()
+            self._event_gen += 1
+            self._turn_had_text = False
+            self._stream_delta_chars = 0
             self._pending_ai_text = ""
             self._conv_entries = data.get("conv_entries", [])
+            # Loaded content already matches this file on disk: mark it as
+            # saved so a plain close (no user edits) does not rewrite it.
+            self._saved_conv_version = self._conv_version
+            if self._busy:
+                self._busy = False
+                self._cancel_event = None
+                self._toggle_send_stop(busy=False)
             if self._llm_client:
                 self._llm_client.set_history(data.get("llm_history", []))
             # Track which file is now active; point current.json at it.
@@ -2350,7 +2590,10 @@ if _WX_AVAILABLE:
             if not self._project_watch_timer:
                 return
             self._active_project = self._collect_active_project()
-            self._watch_candidate_seen = False
+            log.info(
+                "project watch started: active=%r",
+                self._active_project,
+            )
             self._project_watch_timer.Start(
                 1000
             )  # 1 s poll: project switch is noticed quickly once a board signal is available
@@ -2364,10 +2607,10 @@ if _WX_AVAILABLE:
             instead of lingering; the panel opened in the new project
             auto-restores the right session on first display.
 
-            The project signal flaps during project load (GetBoard() stays
-            empty until the board is up, and the window-title fallback is
-            equally transient), so a switch is only acted on after two
-            consecutive identical readings.
+            A switch is acted on as soon as the probe returns a different
+            non-None project.  None readings (mid-switch GetBoard() empty,
+            window-title fallback missing) are deliberately ignored so the
+            last valid project is never downgraded.
             """
             if not self.IsShown():
                 # Panel dismissed: stay silent — no session dialogs from a
@@ -2376,36 +2619,40 @@ if _WX_AVAILABLE:
                 # applied exactly once, when the user looks at the panel.
                 return
             if self._busy:
+                log.debug(
+                    "project watch: busy — skip project poll (active=%r)",
+                    self._active_project,
+                )
                 return
             project = self._collect_active_project()
+            if project is None:
+                # Probing failed (GetBoard empty / no window-title match) —
+                # e.g. mid-project-switch.  Never downgrade a known project
+                # to None: keep the last valid value so session saves keep
+                # their project stamp.
+                log.debug(
+                    "project watch: probe returned None — keeping active=%r",
+                    self._active_project,
+                )
+                return
             if project == self._active_project:
-                self._watch_candidate_seen = False
-                return
-            if not self._watch_candidate_seen:
-                # First differing reading: remember it and wait for a second
-                # identical one before acting.
-                self._watch_candidate_seen = True
-                self._watch_candidate = project
-                return
-            if project != self._watch_candidate:
-                # Still flapping between values (project loading in
-                # background): re-arm with the latest reading.
-                self._watch_candidate = project
                 return
             log.info(
-                "Project switch confirmed: %s -> %s; switching session",
+                "Project switch detected: %s -> %s; switching session",
                 self._active_project,
                 project,
             )
             self._active_project = project
-            self._watch_candidate_seen = False
             # Keep this panel open and re-run the startup restore flow for
             # the new project: matching current.json is restored in place,
             # otherwise the new project's sessions are offered.  Never
             # Destroy() the window — on a top-level wx.Frame that behaves as
             # a forced Close and cascaded into closing KiCad's project
             # windows.
-            self._autoload_session()
+            self._autoload_session(prompt_if_missing=True)
+            # Refresh the footprint index for the newly active project so
+            # find_footprints_not_in_libraries never reads a stale DB.
+            self._request_footprint_sync(project)
 
         def _prompt_project_session_choice(self, project_path: str | None) -> None:
             """Offer the open project's saved sessions after a skip.
@@ -2439,6 +2686,7 @@ if _WX_AVAILABLE:
                 title = d.get("title", "")[:50]
                 labels.append(f"{ts}  —  {title}")
 
+            labels.insert(0, "New session (start blank)")
             dlg = wx.SingleChoiceDialog(
                 self,
                 "Saved sessions for this project found — restore one?",
@@ -2450,8 +2698,11 @@ if _WX_AVAILABLE:
                 return
             idx = dlg.GetSelection()
             dlg.Destroy()
-            if 0 <= idx < len(candidates):
-                self._restore_session_file(candidates[idx])
+            if idx == 0:
+                self._start_blank_session(save_first=False)
+                return
+            if 1 <= idx < len(candidates) + 1:
+                self._restore_session_file(candidates[idx - 1])
 
         def _on_clear(self, event) -> None:
             if self._busy:
@@ -2462,12 +2713,49 @@ if _WX_AVAILABLE:
                 )
                 return
             self._stream_timer.Stop()
-            self._stream_buffer.clear()
+            self._stream_events.clear()
+            self._event_gen += 1
+            self._turn_had_text = False
+            self._stream_delta_chars = 0
             self._conv_entries.clear()
+            self._conv_version += 1
             self._pending_ai_text = ""
             self._render_conversation()
             if self._llm_client:
                 self._llm_client.reset()
+
+        def _finalise_and_save_on_teardown(self) -> None:
+            """Persist the draft + conversation before the panel goes away.
+
+            Bug A: the old code only saved at send / turn-end / stop, so an
+            in-flight turn's answer was lost when KiCad closed mid-turn.
+            Everything the stream consumer already moved into the draft or
+            the archive is finalised and written to disk here.
+            """
+            # Drain any text chunks the producer already enqueued since the
+            # last timer tick — the timer cannot fire between here and
+            # Destroy(), so without this fold the saved answer would lose the
+            # tail received in the last tick window (Bug A's guarantee).
+            gen = self._event_gen
+            for evt in list(self._stream_events):
+                if evt.get("_gen") != gen:
+                    continue
+                if evt.get("type") == "text_chunk":
+                    self._pending_ai_text += evt.get("content") or ""
+                    self._turn_had_text = True
+                    self._stream_delta_chars += len(evt.get("content") or "")
+            if self._pending_ai_text:
+                self._conv_entries.append(
+                    make_ai_entry(
+                        self._pending_ai_text,
+                        datetime.datetime.now().strftime("%H:%M:%S"),
+                    )
+                )
+                self._pending_ai_text = ""
+                self._conv_version += 1
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Could not save session on teardown: %s", err)
 
         def _on_close(self, event) -> None:
             """Panel close: user X hides; watchdog force-close tears down.
@@ -2489,6 +2777,7 @@ if _WX_AVAILABLE:
                 # An in-flight turn ends with the panel: ask it to stop
                 # writing before we tear down.
                 self._cancel_event.set()
+            self._finalise_and_save_on_teardown()
             self._server_mgr.stop()
             self.Destroy()
 
@@ -2514,14 +2803,48 @@ if _WX_AVAILABLE:
             if event.GetEventObject() is self:
                 if self._project_watch_timer is not None:
                     self._project_watch_timer.Stop()
+                self._finalise_and_save_on_teardown()
                 self._server_mgr.stop()
             event.Skip()
+
+        def _request_footprint_sync(self, project_path: str) -> None:
+            """Sync now when the backend is up, else park until it is ready.
+
+            Called from the first-show/auto-load path, which can run before
+            the MCP backend has reported ready; the parked project is
+            flushed by ``_on_server_started`` once the base URL exists.
+            """
+            if self._server_mgr.base_url:
+                self._start_footprint_sync(project_path)
+            else:
+                self._fp_sync_pending = project_path
+
+        def _start_footprint_sync(self, project_path: str) -> None:
+            """Fire a non-force footprint index sync for the project.
+
+            Fired on project open/switch so the index stays fresh for
+            ``find_footprints_not_in_libraries``; now runs through the same
+            chat entry as a user message (tool_direct request) instead of a
+            private thread, so it shares the busy guard, event stream and
+            turn lifecycle.  The call itself is never sent to the LLM — run()
+            executes it directly and records the assistant+tool pair in
+            history.  The server's sync tool guards against duplicates
+            (``already_running``).  Status updates are emitted from the
+            tool-call callback in ``_send_request``.
+            """
+            self._send_request(
+                "tool_direct",
+                {
+                    "name": "sync_footprint_index",
+                    "arguments": {"project_path": project_path},
+                },
+            )
 
         # ------------------------------------------------------------------ #
         # Auto-load
         # ------------------------------------------------------------------ #
 
-        def _autoload_session(self) -> None:
+        def _autoload_session(self, prompt_if_missing: bool = False) -> None:
             """Restore the session pointed to by ``current.json`` on startup.
 
             Project-aware since schema v2: a session is auto-restored only
@@ -2533,6 +2856,11 @@ if _WX_AVAILABLE:
             Only follows current.json — no glob fallback. This ensures "New
             Session" (which removes current.json) always starts blank.
 
+            When *prompt_if_missing* is set (project-switch paths) a missing
+            current.json is *not* treated as "stay blank": the open project's
+            saved sessions are offered instead — a New Session in one project
+            must not freeze the next project into a blank, unsaved state.
+
             Runs when the LLM client is initialised — on first panel display, or
             after a manual backend Restart.  Since every turn is persisted as
             it completes (send/reply/stop), the disk snapshot is always the
@@ -2542,6 +2870,8 @@ if _WX_AVAILABLE:
 
             path = _sstore.resolve_current_session(self._settings.config_dir)
             if path is None:
+                if prompt_if_missing:
+                    self._prompt_project_session_choice(self._collect_active_project())
                 return  # No current.json and no sessions dir — blank start.
 
             data, err = _sstore.load_session(path)
@@ -2563,6 +2893,7 @@ if _WX_AVAILABLE:
                 return
 
             self._conv_entries = conv
+            self._saved_conv_version = self._conv_version
             self._current_session_file = os.path.basename(path)
             if self._llm_client:
                 self._llm_client.set_history(history)
@@ -2729,7 +3060,7 @@ if _WX_AVAILABLE:
             self._js_running = False
             self._stream_wrapper_visible = False
             self._page_watchdog.Stop()
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "status",
                     "text": f"⚠ WebView error: {description}. Retrying…",

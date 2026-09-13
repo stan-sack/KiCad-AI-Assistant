@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kcaa"
-version = "0.2.2"
+version = "0.2.3"
 description = "Model Context Protocol (MCP) server for KiCad electronic design automation (EDA) files"
 readme = "README.md"
 license = { text = "MIT" }
@@ -89,6 +89,8 @@ performance = [
     "py-spy>=0.3.0",
 ]
 visualization = [
+    "svglib>=1.5.0",       # SVG parsing for the pure-Python render_image path
+    "reportlab>=4.0.0",    # Drawing tree consumed by svglib
     "cairosvg>=2.7.0",     # SVG to PNG conversion
     "Pillow>=10.0.0",      # Image processing
     "playwright>=1.40.0",  # Browser automation (optional)
